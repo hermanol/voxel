@@ -182,18 +182,14 @@ port_description = "uplink1-cr2"
 
 [[rack_network_config.ports]]
 routes = []
+addresses = []
 switch = "switch0"
 port = "qsfp2"
 uplink_port_speed = "speed100_g"
 uplink_port_fec = "none"
 bgp_peers = []
 autoneg = false
-allow_ddm_traffic = false
-
-[[rack_network_config.ports.addresses]]
-
-[rack_network_config.ports.addresses.address]
-type = "addrconf"
+allow_ddm_traffic = true
 
 [rack_network_config.ports.lldp]
 status = "enabled"
@@ -202,18 +198,14 @@ port_description = "interconnect-qsfp2"
 
 [[rack_network_config.ports]]
 routes = []
+addresses = []
 switch = "switch0"
 port = "qsfp3"
 uplink_port_speed = "speed100_g"
 uplink_port_fec = "none"
 bgp_peers = []
 autoneg = false
-allow_ddm_traffic = false
-
-[[rack_network_config.ports.addresses]]
-
-[rack_network_config.ports.addresses.address]
-type = "addrconf"
+allow_ddm_traffic = true
 
 [rack_network_config.ports.lldp]
 status = "enabled"
@@ -222,18 +214,14 @@ port_description = "interconnect-qsfp3"
 
 [[rack_network_config.ports]]
 routes = []
+addresses = []
 switch = "switch1"
 port = "qsfp2"
 uplink_port_speed = "speed100_g"
 uplink_port_fec = "none"
 bgp_peers = []
 autoneg = false
-allow_ddm_traffic = false
-
-[[rack_network_config.ports.addresses]]
-
-[rack_network_config.ports.addresses.address]
-type = "addrconf"
+allow_ddm_traffic = true
 
 [rack_network_config.ports.lldp]
 status = "enabled"
@@ -242,18 +230,14 @@ port_description = "interconnect-qsfp2"
 
 [[rack_network_config.ports]]
 routes = []
+addresses = []
 switch = "switch1"
 port = "qsfp3"
 uplink_port_speed = "speed100_g"
 uplink_port_fec = "none"
 bgp_peers = []
 autoneg = false
-allow_ddm_traffic = false
-
-[[rack_network_config.ports.addresses]]
-
-[rack_network_config.ports.addresses.address]
-type = "addrconf"
+allow_ddm_traffic = true
 
 [rack_network_config.ports.lldp]
 status = "enabled"
