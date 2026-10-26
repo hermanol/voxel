@@ -214,7 +214,7 @@ impl Effects {
                 }
                 child.forced = Some(result);
             }
-            Effect::Quit => {}
+            Effect::CopyToClipboard(_) | Effect::Quit => {}
         }
     }
 

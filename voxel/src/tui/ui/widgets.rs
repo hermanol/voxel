@@ -11,7 +11,7 @@ use super::{
     deployment,
     renderer::{LayoutMode, MIN_HEIGHT, MIN_WIDTH, layout_mode},
 };
-use crate::tui::app::App;
+use crate::tui::{app::App, event::Confirmation};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -255,16 +255,27 @@ fn styled_groups(groups: Vec<ActionGroup>) -> Line<'static> {
 fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     let group = |key, description| ActionGroup { key, description };
     let lifecycle = || {
-        vec![group(
-            "q",
-            if app.resources_may_exist() { "destroy+quit" } else { "quit" },
-        )]
+        vec![
+            group("d", "detach"),
+            group(
+                "q",
+                if app.resources_may_exist() { "destroy+quit" } else { "quit" },
+            ),
+        ]
     };
     let contextual_navigation = if narrow { "Tab/⇧" } else { "Tab/S-Tab" };
-    if app.session.confirmation.is_some() {
+    if let Some(confirmation) = &app.session.confirmation {
         return vec![
             group("↑/↓", "move"),
             group("Enter", "select"),
+            group(
+                "y",
+                if matches!(confirmation, Confirmation::Detach) {
+                    "copy command"
+                } else {
+                    "confirm"
+                },
+            ),
             group("n/Esc", "back"),
         ];
     }
@@ -275,6 +286,7 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     }
     let mut groups = Vec::new();
     if app.can_cancel() {
+        // Leaving the deployment running is `d`, in the lifecycle group.
         groups.push(group("x", if narrow { "" } else { "destroy" }));
     } else {
         for (kind, key, description) in [
@@ -443,7 +455,7 @@ mod tests {
             (
                 "confirmation",
                 app(&|app| app.session.confirmation = Some(Confirmation::Quit)),
-                "Enter select",
+                "y confirm",
                 None,
             ),
         ];

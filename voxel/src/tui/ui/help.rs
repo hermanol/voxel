@@ -22,6 +22,7 @@ const GLOBAL: &[(&str, &str)] = &[
     ("Space", "Fold / expand section"),
     ("?", "Toggle help"),
     ("Esc", "Close help or a dialog"),
+    ("d", "Leave the TUI, keep the deployment running"),
     ("q", "Quit and destroy the deployment"),
 ];
 const DEPLOYMENT: &[(&str, &str)] = &[
@@ -34,6 +35,7 @@ const DEPLOYMENT: &[(&str, &str)] = &[
 const DIALOGS: &[(&str, &str)] = &[
     ("↑ / ↓", "Select option"),
     ("Enter", "Confirm selection"),
+    ("y", "Confirm; when leaving, copy the resume command"),
     ("n", "Reject"),
     ("Esc", "Close dialog"),
 ];

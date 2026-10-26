@@ -30,11 +30,13 @@ pub struct TerminalSize {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PostOperationExit {
+    Detach,
     Destroy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionExit {
+    Detach,
     Quit,
 }
 
@@ -238,6 +240,8 @@ pub struct App {
     pub logs: BoundedLogs,
     pub logs_filter: LogFilter,
     pub durable_log_path: String,
+    pub reattach_command: Option<String>,
+    pub clipboard_copied: bool,
     pub now: Option<Instant>,
     pub splash: Option<crate::tui::ui::splash::Splash>,
     next_operation_request_id: Option<OperationRequestId>,
@@ -278,6 +282,8 @@ impl App {
             logs: BoundedLogs::new(log_capacity),
             logs_filter: LogFilter::All,
             durable_log_path: "voxel-tui.log".into(),
+            reattach_command: None,
+            clipboard_copied: false,
             now: None,
             splash: None,
             next_operation_request_id: Some(OperationRequestId::FIRST),
@@ -346,12 +352,12 @@ impl App {
     fn action(&mut self, action: Action) -> Vec<Effect> {
         if let Some(confirmation) = self.session.confirmation.clone() {
             let options = confirmation.options();
-            return match action {
-                Action::Close => {
+            return match (confirmation.clone(), action) {
+                (_, Action::Close) => {
                     self.session.confirmation = None;
                     vec![]
                 }
-                Action::Scroll { delta, .. } => {
+                (_, Action::Scroll { delta, .. }) => {
                     self.session.confirmation_selection = self
                         .session
                         .confirmation_selection
@@ -359,20 +365,56 @@ impl App {
                         .min(options.len().saturating_sub(1));
                     vec![]
                 }
-                Action::Activate => {
+                (_, Action::Activate) => {
                     self.activate_confirmation_option(confirmation)
                 }
-                Action::Reject => {
+                (_, Action::Reject) => {
                     self.session.confirmation = None;
                     vec![]
+                }
+                (Confirmation::Detach, Action::CopyReattachCommand) => {
+                    if self.can_detach()
+                        && let Some(command) = self.reattach_command.clone()
+                    {
+                        self.clipboard_copied = true;
+                        vec![Effect::CopyToClipboard(command)]
+                    } else {
+                        vec![]
+                    }
+                }
+                // `y` confirms ordinary dialogs; detach reserves it for the
+                // reattach-command clipboard fallback above.
+                (_, Action::CopyReattachCommand) => {
+                    self.session.confirmation = None;
+                    self.confirm(confirmation)
                 }
                 _ => vec![],
             };
         }
-        if self.session.post_operation_exit.is_none()
-            && !self.session.quitting
-            && action == Action::RequestQuit
+        if self.session.post_operation_exit.is_none() && !self.session.quitting
         {
+            match action {
+                Action::RequestDetach if self.can_detach() => {
+                    self.open_confirmation(Confirmation::Detach);
+                    return vec![];
+                }
+                Action::RequestQuit => {
+                    let confirmation = if self.resources_may_exist() {
+                        Confirmation::QuitAndDestroy
+                    } else {
+                        Confirmation::Quit
+                    };
+                    self.open_confirmation(confirmation);
+                    return vec![];
+                }
+                _ => {}
+            }
+        }
+        if self.session.post_operation_exit == Some(PostOperationExit::Detach)
+            && !self.session.quitting
+            && let Action::RequestQuit = action
+        {
+            self.session.post_operation_exit = None;
             let confirmation = if self.resources_may_exist() {
                 Confirmation::QuitAndDestroy
             } else {
@@ -423,7 +465,10 @@ impl App {
             Action::RequestRoute if self.can_start(OperationKind::Route) => {
                 self.open_confirmation(Confirmation::Route)
             }
-            Action::RequestCancelAndDestroy if self.can_cancel() => {
+            Action::RequestCancelAndDestroy
+                if self.can_cancel()
+                    || self.can_upgrade_cancel_to_destroy() =>
+            {
                 self.open_confirmation(Confirmation::CancelAndDestroy)
             }
             // Escalation: once the stop is already in flight, the same key
@@ -507,6 +552,12 @@ impl App {
     pub(crate) fn can_cancel(&self) -> bool {
         self.operation.active.as_ref().is_some_and(|active| !active.cancelling)
     }
+    fn can_upgrade_cancel_to_destroy(&self) -> bool {
+        self.operation.active.as_ref().is_some_and(|active| {
+            active.cancelling
+                && active.cancel_choice == Some(CancelChoice::Leave)
+        })
+    }
     fn can_force_stop(&self) -> bool {
         self.operation
             .active
@@ -514,6 +565,7 @@ impl App {
             .is_some_and(|active| !active.force_stop_requested)
     }
     fn open_confirmation(&mut self, confirmation: Confirmation) {
+        self.clipboard_copied = false;
         self.session.confirmation_selection =
             confirmation.options().len().saturating_sub(1);
         self.session.confirmation = Some(confirmation);
@@ -546,6 +598,11 @@ impl App {
             Confirmation::Route if self.can_start(OperationKind::Route) => {
                 self.start(OperationKind::Route)
             }
+            Confirmation::Detach
+                if !self.session.quitting && self.can_detach() =>
+            {
+                self.detach()
+            }
             Confirmation::Quit
                 if !self.session.quitting && !self.resources_may_exist() =>
             {
@@ -558,7 +615,10 @@ impl App {
             {
                 self.destroy_and_quit()
             }
-            Confirmation::CancelAndDestroy if self.can_cancel() => {
+            Confirmation::CancelAndDestroy
+                if self.can_cancel()
+                    || self.can_upgrade_cancel_to_destroy() =>
+            {
                 vec![self.cancel(CancelChoice::Destroy)]
             }
             Confirmation::ForceStop if self.can_force_stop() => {
@@ -569,6 +629,38 @@ impl App {
             }
             _ => vec![],
         }
+    }
+    fn detach(&mut self) -> Vec<Effect> {
+        if !self.can_detach() {
+            return vec![];
+        }
+        if let Some(active) = self.operation.active.as_ref() {
+            self.session.post_operation_exit = Some(PostOperationExit::Detach);
+            if active.cancelling {
+                return vec![];
+            }
+            return vec![self.cancel(CancelChoice::Leave)];
+        }
+        if self.operation.pending.is_some() {
+            self.session.post_operation_exit = Some(PostOperationExit::Detach);
+            return vec![];
+        }
+        self.session.exit = Some(SessionExit::Detach);
+        self.session.quitting = true;
+        vec![Effect::Quit]
+    }
+    fn can_detach(&self) -> bool {
+        self.reattach_command.is_some()
+            && self.session.post_operation_exit.is_none()
+            && !self.operation.active.as_ref().is_some_and(|active| {
+                active.kind == OperationKind::Destroy
+                    || active.cancel_choice == Some(CancelChoice::Destroy)
+            })
+            && !self
+                .operation
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.kind == OperationKind::Destroy)
     }
     fn destroy_and_quit(&mut self) -> Vec<Effect> {
         self.session.post_operation_exit = Some(PostOperationExit::Destroy);
@@ -711,11 +803,19 @@ impl App {
                     self.operation.active =
                         Some(ActiveOperation::new(request_id, kind));
                     self.operation.outcome = None;
-                    if self.session.post_operation_exit
-                        == Some(PostOperationExit::Destroy)
-                        && kind != OperationKind::Destroy
-                    {
-                        effects.push(self.cancel(CancelChoice::Destroy));
+                    let deferred = match self.session.post_operation_exit {
+                        Some(PostOperationExit::Detach) => {
+                            Some(CancelChoice::Leave)
+                        }
+                        Some(PostOperationExit::Destroy)
+                            if kind != OperationKind::Destroy =>
+                        {
+                            Some(CancelChoice::Destroy)
+                        }
+                        _ => None,
+                    };
+                    if let Some(choice) = deferred {
+                        effects.push(self.cancel(choice));
                     }
                 }
             }
@@ -768,10 +868,21 @@ impl App {
                             || (self.session.post_operation_exit.is_none()
                                 && cancel_choice
                                     == Some(CancelChoice::Destroy)));
-                    let should_quit = self.session.post_operation_exit
-                        == Some(PostOperationExit::Destroy)
-                        && active_kind == OperationKind::Destroy
-                        && command_succeeded(&outcome);
+                    let should_quit = match self.session.post_operation_exit {
+                        Some(PostOperationExit::Detach) => true,
+                        Some(PostOperationExit::Destroy)
+                            if active_kind == OperationKind::Destroy =>
+                        {
+                            command_succeeded(&outcome)
+                        }
+                        Some(PostOperationExit::Destroy) => false,
+                        None => false,
+                    };
+                    let exit = match self.session.post_operation_exit {
+                        Some(PostOperationExit::Detach) => SessionExit::Detach,
+                        Some(PostOperationExit::Destroy) => SessionExit::Quit,
+                        None => SessionExit::Quit,
+                    };
                     self.operation.outcome = Some(outcome);
                     if should_start_destroy {
                         let destroy_effects =
@@ -783,7 +894,7 @@ impl App {
                     } else {
                         self.session.post_operation_exit = None;
                         if should_quit {
-                            self.session.exit = Some(SessionExit::Quit);
+                            self.session.exit = Some(exit);
                             self.session.quitting = true;
                             effects.push(Effect::Quit);
                         }
@@ -965,5 +1076,31 @@ mod tests {
                 "{case}: Enter on the default option"
             );
         }
+    }
+
+    #[test]
+    fn detach_during_launch_defers_and_quit_stays_reachable() {
+        let mut app = active_app();
+        app.reattach_command = Some("pfexec voxel tui".into());
+        app.deployment.observed = ObservedDeploymentState::Running;
+
+        // Detach is deferred because a launch is active, which it cancels.
+        app.open_confirmation(Confirmation::Detach);
+        assert_eq!(
+            confirm(&mut app),
+            vec![Effect::Cancel {
+                request_id: OperationRequestId::FIRST,
+                choice: CancelChoice::Leave,
+            }]
+        );
+        assert_eq!(
+            (app.session.quitting, app.session.post_operation_exit),
+            (false, Some(PostOperationExit::Detach))
+        );
+
+        // Quit must still be reachable; it clears the deferred detach.
+        app.update(AppEvent::Action(Action::RequestQuit));
+        assert!(app.session.confirmation.is_some());
+        assert!(app.session.post_operation_exit.is_none());
     }
 }

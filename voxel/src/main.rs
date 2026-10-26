@@ -82,7 +82,10 @@ struct Cli {
 enum Cmd {
     /// Open the terminal interface.
     #[cfg(feature = "tui")]
-    Tui,
+    Tui {
+        #[command(subcommand)]
+        cmd: Option<TuiCmd>,
+    },
     /// Launch the rack and stream RSS bring-up progress.
     Launch {
         /// Don't watch RSS bring-up after launch.
@@ -214,6 +217,17 @@ enum Cmd {
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+
+#[cfg(feature = "tui")]
+#[derive(Subcommand)]
+enum TuiCmd {
+    /// Resume a detached TUI session.
+    Resume {
+        /// Choose from all available sessions.
+        #[arg(long)]
+        choose: bool,
     },
 }
 
@@ -740,6 +754,10 @@ fn resolve_tui_context(
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
     #[cfg(feature = "tui")]
+    if let Cmd::Tui { cmd: Some(TuiCmd::Resume { choose }) } = &cli.cmd {
+        return tui::resume(*choose);
+    }
+    #[cfg(feature = "tui")]
     let invocation_dir = Utf8PathBuf::try_from(
         std::env::current_dir().context("resolve invocation directory")?,
     )
@@ -757,7 +775,11 @@ async fn main() -> Result<(), Error> {
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
         #[cfg(feature = "tui")]
-        Cmd::Tui => {
+        Cmd::Tui { cmd } => {
+            debug_assert!(
+                cmd.is_none(),
+                "resume dispatched before configuration"
+            );
             let context = resolve_tui_context(
                 &cli,
                 &config_path,
@@ -986,6 +1008,14 @@ mod main_tests {
     fn parses_tui_commands_and_preserves_launch_parsing() {
         let tui = cfg!(feature = "tui");
         assert_eq!(Cli::try_parse_from(["voxel", "tui"]).is_ok(), tui);
+        assert_eq!(
+            Cli::try_parse_from(["voxel", "tui", "resume"]).is_ok(),
+            tui
+        );
+        assert_eq!(
+            Cli::try_parse_from(["voxel", "tui", "resume", "--choose"]).is_ok(),
+            tui
+        );
         assert!(Cli::try_parse_from(["voxel", "launch", "--emu"]).is_ok());
     }
 }

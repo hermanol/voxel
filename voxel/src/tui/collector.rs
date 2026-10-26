@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Runs commands on deployment nodes: bounded SSH to sleds, whose host-LAN
-//! addresses Falcon discovers once, and Falcon serial execution on routers.
+//! addresses Falcon discovers once or a resumed session supplies, and Falcon
+//! serial execution on routers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
@@ -91,16 +92,28 @@ struct IpCache {
 }
 
 impl IpCache {
-    fn from_config(config: &VoxelConfig) -> Self {
-        let mut resolved = BTreeMap::new();
+    fn from_config_and_addresses(
+        config: &VoxelConfig,
+        mut resolved: BTreeMap<String, String>,
+    ) -> Self {
         if config.external.isolated() {
             resolved.extend(config.static_external_ips());
         }
         Self { resolved, in_flight: BTreeMap::new() }
     }
 
-    fn address_for_probe(&self, host: &str) -> Option<String> {
-        self.resolved.get(host).cloned()
+    fn address_for_probe(
+        &self,
+        host: &str,
+        resumed: bool,
+    ) -> anyhow::Result<Option<String>> {
+        match self.resolved.get(host) {
+            Some(ip) => Ok(Some(ip.clone())),
+            None if resumed => Err(anyhow!(
+                "telemetry for {host} is unavailable after resuming without a saved address"
+            )),
+            None => Ok(None),
+        }
     }
 }
 
@@ -109,6 +122,7 @@ pub(crate) struct FalconExecutor {
     ips: Arc<Mutex<IpCache>>,
     router_commands: Arc<Mutex<BTreeSet<String>>>,
     serial_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    resumed: bool,
     timeout: Duration,
 }
 
@@ -116,13 +130,18 @@ impl FalconExecutor {
     pub(crate) fn new(
         topo: crate::topo::Topo,
         config: &VoxelConfig,
+        addresses: BTreeMap<String, String>,
+        resumed: bool,
         timeout: Duration,
     ) -> Self {
         Self {
             topo: Arc::new(topo),
-            ips: Arc::new(Mutex::new(IpCache::from_config(config))),
+            ips: Arc::new(Mutex::new(IpCache::from_config_and_addresses(
+                config, addresses,
+            ))),
             router_commands: Default::default(),
             serial_tasks: Default::default(),
+            resumed,
             timeout,
         }
     }
@@ -153,9 +172,13 @@ impl FalconExecutor {
         }
     }
 
+    pub(crate) async fn resolved_addresses(&self) -> BTreeMap<String, String> {
+        self.ips.lock().await.resolved.clone()
+    }
+
     async fn sled_ip(&self, host: &str) -> anyhow::Result<String> {
         let mut cache = self.ips.lock().await;
-        if let Some(ip) = cache.address_for_probe(host) {
+        if let Some(ip) = cache.address_for_probe(host, self.resumed)? {
             return Ok(ip);
         }
         let node = self
