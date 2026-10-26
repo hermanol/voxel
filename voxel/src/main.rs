@@ -697,21 +697,43 @@ fn anchor_workdir(
 }
 
 #[cfg(feature = "tui")]
-fn resolve_tui_workdir(
+fn resolve_tui_context(
     cli: &Cli,
     config_path: &Utf8Path,
-    config: &VoxelConfig,
+    config: VoxelConfig,
     invocation_dir: &Utf8Path,
-) -> anyhow::Result<Utf8PathBuf> {
+) -> anyhow::Result<tui::TuiContext> {
     let make_absolute = |path: Utf8PathBuf| {
         if path.is_absolute() { path } else { invocation_dir.join(path) }
     };
-    cli.workdir
+    let workdir = cli
+        .workdir
         .clone()
         .or_else(|| config.falcon.workdir.clone().map(Utf8PathBuf::from))
         .or_else(|| config_path.parent().map(Utf8Path::to_path_buf))
         .map(make_absolute)
-        .context("cannot resolve TUI workdir")
+        .context("cannot resolve TUI workdir")?;
+    let dataset = std::env::var("FALCON_DATASET")
+        .unwrap_or_else(|_| "rpool/falcon".to_string());
+    let build_root = std::env::var("BUILD_ROOT")
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|_| {
+            Utf8PathBuf::from(
+                std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+            )
+            .join("voxel-builds")
+        });
+
+    Ok(tui::TuiContext::new(
+        config_path.to_path_buf(),
+        workdir,
+        cli.name.clone(),
+        dataset,
+        make_absolute(build_root),
+        config,
+        std::env::current_exe().context("resolve current voxel executable")?,
+        std::env::vars_os().collect(),
+    ))
 }
 
 #[tokio::main]
@@ -736,13 +758,13 @@ async fn main() -> Result<(), Error> {
     match &cli.cmd {
         #[cfg(feature = "tui")]
         Cmd::Tui => {
-            let workdir = resolve_tui_workdir(
+            let context = resolve_tui_context(
                 &cli,
                 &config_path,
-                &load_config(&config_path)?,
+                load_config(&config_path)?,
                 &invocation_dir,
             )?;
-            tui::run(workdir).await
+            tui::run(context).await
         }
         Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
             let opts = rack::LaunchOpts {

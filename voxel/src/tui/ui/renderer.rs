@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The render loop. Chooses a layout mode from the terminal size, limits
-//! redraws to a frame budget, and feeds events to the [`App`].
+//! redraws to a frame budget, and moves events and effects between the
+//! [`App`] and the runtime.
 
 use crate::tui::{App, AppEvent, Effect};
 use ratatui::{Terminal, backend::Backend, layout::Rect};
@@ -79,7 +80,21 @@ pub enum LoopExit {
     ConfirmedExit,
     Cancelled,
     EventChannelClosed,
+    EffectChannelClosed { unsent: Vec<Effect> },
     RenderFailed { message: String },
+}
+
+fn forward_effects(
+    sender: &mpsc::UnboundedSender<Effect>,
+    effects: Vec<Effect>,
+) -> Result<(), Vec<Effect>> {
+    let mut effects = effects.into_iter();
+    while let Some(current) = effects.next() {
+        if let Err(error) = sender.send(current) {
+            return Err(std::iter::once(error.0).chain(effects).collect());
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_loop<B: Backend>(
@@ -87,6 +102,7 @@ pub async fn run_loop<B: Backend>(
     renderer: &mut Renderer,
     app: &mut App,
     events: &mut mpsc::Receiver<AppEvent>,
+    effects: &mpsc::UnboundedSender<Effect>,
     cancel: CancellationToken,
 ) -> io::Result<LoopExit> {
     if let Err(error) = renderer.draw(terminal, app, true) {
@@ -106,8 +122,65 @@ pub async fn run_loop<B: Backend>(
         if let Err(error) = renderer.draw(terminal, app, force_draw) {
             return Ok(LoopExit::RenderFailed { message: error.to_string() });
         }
-        if pending_effects.contains(&Effect::Quit) {
+        let confirmed_exit =
+            pending_effects.iter().any(|effect| matches!(effect, Effect::Quit));
+        if let Err(unsent) = forward_effects(effects, pending_effects) {
+            return Ok(LoopExit::EffectChannelClosed { unsent });
+        }
+        if confirmed_exit {
             return Ok(LoopExit::ConfirmedExit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::Action;
+    use crate::tui::event::OperationRequestId;
+    use crate::tui::operation::OperationKind;
+    use crate::tui::reconcile::ObservedDeploymentState;
+    use ratatui::backend::TestBackend;
+
+    /// An action the operator confirmed is handed back, not dropped, when the
+    /// runtime can no longer receive it.
+    #[tokio::test]
+    async fn closed_effect_receiver_returns_exact_unsent_effect() {
+        let mut app = App::new(2);
+        app.deployment.observed = ObservedDeploymentState::Stopped;
+        let (tx, mut rx) = mpsc::channel(3);
+        // Open the launch dialog, select Launch above the default, confirm.
+        for action in [
+            Action::RequestLaunch,
+            Action::Scroll { delta: -1, page: false },
+            Action::Activate,
+        ] {
+            tx.send(action.into()).await.unwrap();
+        }
+        drop(tx);
+        let (effects_tx, mut effects_rx) = mpsc::unbounded_channel();
+        effects_rx.close();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        let exit = run_loop(
+            &mut terminal,
+            &mut Renderer::new(Duration::ZERO),
+            &mut app,
+            &mut rx,
+            &effects_tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            exit,
+            LoopExit::EffectChannelClosed {
+                unsent: vec![Effect::Start {
+                    request_id: OperationRequestId::FIRST,
+                    kind: OperationKind::Launch,
+                }],
+            }
+        );
     }
 }

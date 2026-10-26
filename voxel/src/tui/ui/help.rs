@@ -18,9 +18,18 @@ use ratatui::{
 };
 
 const GLOBAL: &[(&str, &str)] = &[
+    ("Tab / Shift-Tab", "Next / previous section"),
+    ("Space", "Fold / expand section"),
     ("?", "Toggle help"),
     ("Esc", "Close help or a dialog"),
-    ("q", "Quit the TUI"),
+    ("q", "Quit and destroy the deployment"),
+];
+const DEPLOYMENT: &[(&str, &str)] = &[
+    ("↑ / ↓", "Move within section"),
+    ("PgUp / PgDn", "Page content"),
+    ("f", "Cycle log filter"),
+    ("l / r", "Launch / route"),
+    ("x", "Stop the operation and destroy the deployment"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
     ("↑ / ↓", "Select option"),
@@ -42,9 +51,12 @@ fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
 
 fn help_text() -> Text<'static> {
     let mut lines = Vec::new();
-    for (title, rows) in
-        [("Global", GLOBAL), ("Dialogs", DIALOGS), ("Help", HELP)]
-    {
+    for (title, rows) in [
+        ("Global", GLOBAL),
+        ("Deployment", DEPLOYMENT),
+        ("Dialogs", DIALOGS),
+        ("Help", HELP),
+    ] {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
