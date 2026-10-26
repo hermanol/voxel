@@ -56,8 +56,11 @@ pub fn key_action(key: KeyEvent) -> Option<Action> {
         return None;
     }
     Some(match key.code {
+        KeyCode::Char('v') => Action::ToggleView,
         KeyCode::Tab => Action::NextSection,
         KeyCode::BackTab => Action::PreviousSection,
+        KeyCode::Left => Action::Left,
+        KeyCode::Right => Action::Right,
         KeyCode::Enter => Action::Activate,
         KeyCode::Char(' ') => Action::ToggleSection,
         KeyCode::Char('?') => Action::ToggleHelp,
@@ -413,8 +416,11 @@ mod tests {
     #[test]
     fn every_documented_key_maps_and_nothing_else_acts() {
         let cases = [
+            (KeyCode::Char('v'), Some(Action::ToggleView)),
             (KeyCode::Tab, Some(Action::NextSection)),
             (KeyCode::BackTab, Some(Action::PreviousSection)),
+            (KeyCode::Left, Some(Action::Left)),
+            (KeyCode::Right, Some(Action::Right)),
             (KeyCode::Enter, Some(Action::Activate)),
             (KeyCode::Char(' '), Some(Action::ToggleSection)),
             (KeyCode::Char('?'), Some(Action::ToggleHelp)),

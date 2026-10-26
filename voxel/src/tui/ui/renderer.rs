@@ -159,7 +159,7 @@ mod tests {
     /// runtime can no longer receive it.
     #[tokio::test]
     async fn closed_effect_receiver_returns_exact_unsent_effect() {
-        let mut app = App::new(2);
+        let mut app = App::new(vec![], 2);
         app.deployment.observed = ObservedDeploymentState::Stopped;
         let (tx, mut rx) = mpsc::channel(3);
         // Open the launch dialog, select Launch above the default, confirm.

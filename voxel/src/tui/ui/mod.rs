@@ -10,9 +10,13 @@ pub mod confirm_dialog;
 pub mod deployment;
 pub mod help;
 pub mod logs;
+pub mod monitor;
+pub mod node_detail;
 pub(crate) mod popup;
+pub mod rack_selector;
 pub mod renderer;
 pub mod splash;
+pub(crate) mod topology;
 pub mod widgets;
 
 #[cfg(test)]

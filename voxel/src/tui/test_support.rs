@@ -12,9 +12,49 @@ use crossterm::event::KeyCode;
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer};
 use voxel_config::VoxelConfig;
 
+use super::telemetry::{RackId, ResourceDescriptor, ResourceId, ResourceKind};
+
 /// Parse a `voxel.toml` snippet, written as a user would write it.
 pub(crate) fn config(toml: &str) -> VoxelConfig {
     VoxelConfig::from_toml(toml).expect("test config parses")
+}
+
+/// Sled `g{cubby}` in `rack`. Cubbies are numbered across the whole fleet, as
+/// `resource_descriptors` numbers them.
+pub(crate) fn sled(rack: usize, cubby: u8) -> ResourceDescriptor {
+    let name = format!("g{cubby}");
+    ResourceDescriptor {
+        id: ResourceId::rack(RackId(rack), ResourceKind::Sled, &name),
+        rack: Some(RackId(rack)),
+        kind: ResourceKind::Sled,
+        name,
+        host: None,
+        slot: Some(cubby),
+    }
+}
+
+/// The switch zone in `slot`, hosted by scrimlet `host`.
+pub(crate) fn switch(rack: usize, slot: u8, host: &str) -> ResourceDescriptor {
+    ResourceDescriptor {
+        id: ResourceId::rack(RackId(rack), ResourceKind::SwitchZone, host),
+        rack: Some(RackId(rack)),
+        kind: ResourceKind::SwitchZone,
+        name: format!("switch{slot}"),
+        host: Some(host.into()),
+        slot: Some(slot),
+    }
+}
+
+/// A fleet-scoped router VM.
+pub(crate) fn router(name: &str) -> ResourceDescriptor {
+    ResourceDescriptor {
+        id: ResourceId::fleet(ResourceKind::Router, name),
+        rack: None,
+        kind: ResourceKind::Router,
+        name: name.into(),
+        host: None,
+        slot: None,
+    }
 }
 
 /// The keys a footer or help label names, such as `"↑/↓"` or

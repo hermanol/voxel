@@ -13,7 +13,7 @@ path = "src/main.rs"
 [features]
 # `voxel tui`. Building without it leaves the CLI and drops the terminal UI's
 # dependencies.
-tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64"]
+tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64", "dep:chrono"]
 
 [dependencies]
 tokio.workspace = true
@@ -55,6 +55,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 indicatif = "0.18"
 libc = "0.2"
+chrono = { version = "0.4", optional = true }
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).

@@ -2,10 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `voxel tui` terminal interface. [`run`] wires the effects runner, the
-//! renderer and the input and tick tasks around one [`App`], and orders
-//! startup and shutdown so the terminal is restored before anything that can
-//! wait without a bound.
+//! The `voxel tui` terminal interface. [`run`] wires the collector, the
+//! effects runner, the renderer and the input and tick tasks around one
+//! [`App`], and orders startup and shutdown so the terminal is restored before
+//! anything that can wait without a bound.
 
 mod app;
 mod collector;
@@ -18,6 +18,7 @@ mod phase;
 mod process;
 mod reconcile;
 mod session;
+mod telemetry;
 mod terminal;
 #[cfg(test)]
 mod test_support;
@@ -101,6 +102,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
             .context("write durable TUI log")?;
     }
     let (mut detached, reattach) = session::prepare_direct(&context)?;
+    let topology = telemetry::resource_descriptors(&context.config);
     prepare_probe_mounts(&context.workdir, &context.config)?;
     let mut topo = crate::topo::build_topo(&context.config, &context.name)?;
     topo.runner.log = durable.falcon_logger();
@@ -114,13 +116,18 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         resumed_claim.is_some(),
         Duration::from_secs(10),
     ));
+    let collector =
+        Arc::new(collector::Collector::new(executor.clone(), &context.config));
+    let schedule = collector::SchedulerConfig::new(Duration::from_secs(10), 8)?;
     let context = Arc::new(context);
     let (events_tx, mut events_rx) = terminal::event_channel();
     let (effects_tx, effects_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
-    // Reserve admission before a lifecycle child can take it, so the first
-    // operation waits for the deployment's state to be known.
+    // Reserve admission before telemetry can contend for it. If collection
+    // wins startup, a timed-out Falcon serial probe can leave a tracked task
+    // that initial reconciliation then waits on indefinitely while holding
+    // this gate, preventing telemetry from ever publishing another sample.
     let initial_permit = reserve_initial_reconciliation(&admission).await?;
 
     let terminal_writer = OpenOptions::new()
@@ -135,7 +142,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         durable.clone(),
     )
     .context("enter terminal UI")?;
-    let mut app = App::new(500);
+    let mut app = App::new(topology, 500);
     app.durable_log_path = context.workdir.join("voxel-tui.log").to_string();
     if let Some((level, message)) = external_note {
         app.logs.push(app::LogEntry::application(level, message));
@@ -161,6 +168,12 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         tokio::time::sleep(ui::splash::DURATION + ui::splash::FRAME).await;
         splash_ticks.cancel();
     });
+    let mut collection = tokio::spawn(collector.run_gated(
+        schedule,
+        events_tx.clone(),
+        shutdown.clone(),
+        admission.clone(),
+    ));
     let executor_drain = executor.clone();
     let services = effects::Effects::new(
         context.clone(),
@@ -225,6 +238,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     ));
     let mut input_result = None;
     let mut ticks_result = None;
+    let mut collection_result = None;
     let mut effects_result = None;
     let mut initial_result = None;
     let mut primary = None;
@@ -232,6 +246,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         result = &mut loop_future => Some(result),
         result = &mut input => { input_result = Some(result); primary = Some("terminal input stopped unexpectedly".to_string()); None },
         result = &mut ticks => { ticks_result = Some(result); primary = Some("terminal ticks stopped unexpectedly".to_string()); None },
+        result = &mut collection => { collection_result = Some(result); primary = Some("TUI collector stopped unexpectedly".to_string()); None },
         result = &mut effect_task => { effects_result = Some(result); primary = Some("TUI effects task stopped unexpectedly".to_string()); None },
         result = &mut initial => { initial_result = Some(result); primary = Some("initial reconciliation stopped unexpectedly".to_string()); None },
     };
@@ -284,12 +299,14 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
 
     while input_result.is_none()
         || ticks_result.is_none()
+        || collection_result.is_none()
         || effects_result.is_none()
         || initial_result.is_none()
     {
         tokio::select! {
             result = &mut input, if input_result.is_none() => input_result = Some(result),
             result = &mut ticks, if ticks_result.is_none() => ticks_result = Some(result),
+            result = &mut collection, if collection_result.is_none() => collection_result = Some(result),
             result = &mut effect_task, if effects_result.is_none() => effects_result = Some(result),
             result = &mut initial, if initial_result.is_none() => initial_result = Some(result),
             event = events_rx.recv() => if let Some(event) = event { let _ = app.update(event); },
@@ -311,6 +328,9 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     }
     if let Some(Err(error)) = ticks_result {
         cleanup.push(format!("terminal ticks task failed: {error}"));
+    }
+    if let Some(Err(error)) = collection_result {
+        cleanup.push(format!("TUI collector task failed: {error}"));
     }
     if let Some(Err(error)) = effects_result {
         cleanup.push(format!("TUI effects task failed: {error}"));

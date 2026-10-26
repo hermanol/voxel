@@ -18,10 +18,11 @@ use ratatui::{
 };
 
 const GLOBAL: &[(&str, &str)] = &[
+    ("v", "Toggle Deployment / Monitoring"),
     ("Tab / Shift-Tab", "Next / previous section"),
     ("Space", "Fold / expand section"),
     ("?", "Toggle help"),
-    ("Esc", "Close help or a dialog"),
+    ("Esc", "Close pane or selection"),
     ("d", "Leave the TUI, keep the deployment running"),
     ("q", "Quit and destroy the deployment"),
 ];
@@ -32,8 +33,13 @@ const DEPLOYMENT: &[(&str, &str)] = &[
     ("l / r", "Launch / route"),
     ("x", "Stop the operation and destroy the deployment"),
 ];
+const MONITORING: &[(&str, &str)] = &[
+    ("← / →", "Previous / next rack; sibling node in the rack"),
+    ("↑ / ↓", "Move within section"),
+    ("Enter / Esc", "Focus node details / back to the rack"),
+];
 const DIALOGS: &[(&str, &str)] = &[
-    ("↑ / ↓", "Select option"),
+    ("← / →", "Select option"),
     ("Enter", "Confirm selection"),
     ("y", "Confirm; when leaving, copy the resume command"),
     ("n", "Reject"),
@@ -56,6 +62,7 @@ fn help_text() -> Text<'static> {
     for (title, rows) in [
         ("Global", GLOBAL),
         ("Deployment", DEPLOYMENT),
+        ("Monitoring", MONITORING),
         ("Dialogs", DIALOGS),
         ("Help", HELP),
     ] {

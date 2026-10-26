@@ -3,13 +3,24 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The vocabulary shared by input, background tasks, the [`App`](super::App)
-//! state machine and the effects runner: panes, key actions, confirmations
-//! and their options, effects and application events.
+//! state machine and the effects runner: views and panes, key actions,
+//! confirmations and their options, effects and application events.
 
 use std::time::Instant;
 
-use crate::tui::operation::{OperationEvent, OperationKind};
-use crate::tui::reconcile::{ReconciliationResult, RouteEvidence};
+use crate::tui::operation::{LogLevel, OperationEvent, OperationKind};
+use crate::tui::reconcile::{
+    ReconciliationResult, RouteEvidence, RssObservation,
+};
+use crate::tui::telemetry::{
+    HealthDiagnostic, NodeAddresses, RackId, ResourceId,
+};
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum View {
+    Deployment,
+    Monitor,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum DeploymentPane {
@@ -28,6 +39,16 @@ impl DeploymentPane {
         Self::CurrentPhase,
         Self::Logs,
     ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MonitoringPane {
+    RackSummary,
+    Topology,
+}
+
+impl MonitoringPane {
+    pub(crate) const ORDER: [Self; 2] = [Self::RackSummary, Self::Topology];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,15 +148,31 @@ impl OperationRequestId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
-    Start { request_id: OperationRequestId, kind: OperationKind },
-    Cancel { request_id: OperationRequestId, choice: CancelChoice },
-    ForceStop { request_id: OperationRequestId },
+    Start {
+        request_id: OperationRequestId,
+        kind: OperationKind,
+    },
+    Cancel {
+        request_id: OperationRequestId,
+        choice: CancelChoice,
+    },
+    ForceStop {
+        request_id: OperationRequestId,
+    },
     CopyToClipboard(String),
+    /// Append a monitoring outcome to the durable TUI log.
+    RecordMonitoring {
+        level: LogLevel,
+        message: String,
+    },
     Quit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
+    ToggleView,
+    Left,
+    Right,
     NextSection,
     PreviousSection,
     Activate,
@@ -182,6 +219,36 @@ pub enum AppEvent {
     OperationStartFailed {
         request_id: OperationRequestId,
         kind: OperationKind,
+        message: String,
+    },
+    Health {
+        id: ResourceId,
+        at: Instant,
+        diagnostic: HealthDiagnostic,
+    },
+    HealthFailed {
+        id: ResourceId,
+        at: Instant,
+        message: String,
+    },
+    Addresses {
+        id: ResourceId,
+        at: Instant,
+        addresses: NodeAddresses,
+    },
+    AddressesFailed {
+        id: ResourceId,
+        at: Instant,
+        message: String,
+    },
+    Rss {
+        rack: RackId,
+        at: Instant,
+        observation: RssObservation,
+    },
+    RssFailed {
+        rack: RackId,
+        at: Instant,
         message: String,
     },
     DurableLogFailed {

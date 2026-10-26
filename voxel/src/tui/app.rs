@@ -3,16 +3,17 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The TUI state machine. [`App::update`] folds each [`AppEvent`] into the
-//! deployment, operation and session state and returns the [`Effect`]s the
-//! runtime must carry out; it performs no I/O, so the renderer and tests
-//! drive it directly.
+//! deployment, operation, observability and session state and returns the
+//! [`Effect`]s the runtime must carry out; it performs no I/O, so the renderer
+//! and tests drive it directly.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use crate::tui::event::{
     Action, AppEvent, CancelChoice, Confirmation, ConfirmationOptionAction,
-    DeploymentPane, Direction, Effect, OperationRequestId,
+    DeploymentPane, Direction, Effect, MonitoringPane, OperationRequestId,
+    View,
 };
 use crate::tui::operation::{
     CommandOutcome, LogLevel, OperationEvent, OperationKind, OperationPhase,
@@ -20,6 +21,11 @@ use crate::tui::operation::{
 };
 use crate::tui::reconcile::{
     ObservedDeploymentState, ReconciliationResult, RouteEvidence,
+    RssObservation,
+};
+use crate::tui::telemetry::{
+    HealthDiagnostic, LatestSample, NodeAddresses, RackId, ResourceDescriptor,
+    ResourceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,12 +48,19 @@ pub enum SessionExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionState {
+    pub view: View,
     pub deployment_pane: DeploymentPane,
+    pub monitoring_pane: MonitoringPane,
     pub collapsed_deployment: BTreeSet<DeploymentPane>,
+    pub collapsed_monitoring: BTreeSet<MonitoringPane>,
     pub phase_scroll: usize,
     pub help_scroll: usize,
     pub help_open: bool,
+    pub selected_rack: Option<RackId>,
+    pub selected_resource: Option<ResourceId>,
     pub terminal: TerminalSize,
+    pub detail_open: bool,
+    pub detail_scroll: usize,
     pub confirmation: Option<Confirmation>,
     pub confirmation_selection: usize,
     pub post_operation_exit: Option<PostOperationExit>,
@@ -59,11 +72,17 @@ impl SessionState {
     pub(crate) fn deployment_expanded(&self, pane: DeploymentPane) -> bool {
         !self.collapsed_deployment.contains(&pane)
     }
+
+    pub(crate) fn monitoring_expanded(&self, pane: MonitoringPane) -> bool {
+        !self.collapsed_monitoring.contains(&pane)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct DeploymentState {
+    pub topology: Vec<ResourceDescriptor>,
     pub observed: ObservedDeploymentState,
+    pub rss: BTreeMap<RackId, LatestSample<RssObservation>>,
     pub routes: RouteEvidence,
     pub last_reconciliation: Option<ReconciliationResult>,
     pub last_reconciliation_at: Option<Instant>,
@@ -233,30 +252,61 @@ impl OperationState {
 }
 
 #[derive(Clone, Debug)]
+pub struct ObservabilityState {
+    pub health: BTreeMap<ResourceId, LatestSample<HealthDiagnostic>>,
+    pub addresses: BTreeMap<ResourceId, LatestSample<NodeAddresses>>,
+}
+
+#[derive(Clone, Debug)]
 pub struct App {
     pub session: SessionState,
     pub deployment: DeploymentState,
     pub operation: OperationState,
+    pub observability: ObservabilityState,
     pub logs: BoundedLogs,
     pub logs_filter: LogFilter,
     pub durable_log_path: String,
     pub reattach_command: Option<String>,
     pub clipboard_copied: bool,
+    /// The last error logged per monitoring source, so a persistent failure
+    /// is logged once and its recovery is logged when it clears.
+    logged_monitoring_errors: BTreeMap<String, String>,
     pub now: Option<Instant>,
     pub splash: Option<crate::tui::ui::splash::Splash>,
     next_operation_request_id: Option<OperationRequestId>,
 }
 
 impl App {
-    pub fn new(log_capacity: usize) -> Self {
-        Self {
+    pub fn new(topology: Vec<ResourceDescriptor>, log_capacity: usize) -> Self {
+        let topology = Self::normalize_topology(topology);
+        let health = topology
+            .iter()
+            .map(|d| (d.id.clone(), LatestSample::default()))
+            .collect();
+        let addresses = topology
+            .iter()
+            .map(|d| (d.id.clone(), LatestSample::default()))
+            .collect();
+        let rss = topology
+            .iter()
+            .filter_map(|d| d.rack)
+            .map(|rack| (rack, LatestSample::default()))
+            .collect();
+        let mut app = Self {
             session: SessionState {
+                view: View::Deployment,
                 deployment_pane: DeploymentPane::OverallProgress,
+                monitoring_pane: MonitoringPane::Topology,
                 collapsed_deployment: BTreeSet::new(),
+                collapsed_monitoring: BTreeSet::new(),
                 phase_scroll: 0,
                 help_scroll: 0,
                 help_open: false,
+                selected_rack: None,
+                selected_resource: None,
                 terminal: TerminalSize { width: 0, height: 0 },
+                detail_open: false,
+                detail_scroll: 0,
                 confirmation: None,
                 confirmation_selection: 0,
                 post_operation_exit: None,
@@ -264,7 +314,9 @@ impl App {
                 quitting: false,
             },
             deployment: DeploymentState {
+                topology,
                 observed: ObservedDeploymentState::Unknown,
+                rss,
                 routes: RouteEvidence::Unknown,
                 last_reconciliation: None,
                 last_reconciliation_at: None,
@@ -279,19 +331,24 @@ impl App {
                 outcome: None,
                 start_failure: None,
             },
+            observability: ObservabilityState { health, addresses },
             logs: BoundedLogs::new(log_capacity),
             logs_filter: LogFilter::All,
             durable_log_path: "voxel-tui.log".into(),
             reattach_command: None,
             clipboard_copied: false,
+            logged_monitoring_errors: BTreeMap::new(),
             now: None,
             splash: None,
             next_operation_request_id: Some(OperationRequestId::FIRST),
-        }
+        };
+        app.repair_selection();
+        app
     }
 
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
         let mut effects = vec![];
+        self.log_monitoring_outcome(&event, &mut effects);
         match event {
             AppEvent::Action(action) => {
                 // Any key skips the launch animation, as in wicket.
@@ -340,6 +397,80 @@ impl App {
                     self.session.post_operation_exit = None;
                 }
             }
+            AppEvent::Health { id, at, diagnostic } => {
+                if self
+                    .observability
+                    .health
+                    .get(&id)
+                    .is_some_and(|sample| Self::accept_attempt(sample, at))
+                {
+                    let sample =
+                        self.observability.health.get_mut(&id).unwrap();
+                    sample.record_success(at, diagnostic);
+                }
+            }
+            AppEvent::HealthFailed { id, at, message } => {
+                if self
+                    .observability
+                    .health
+                    .get(&id)
+                    .is_some_and(|sample| Self::accept_attempt(sample, at))
+                {
+                    let sample =
+                        self.observability.health.get_mut(&id).unwrap();
+                    sample.record_error(at, message);
+                }
+            }
+            AppEvent::Addresses { id, at, addresses } => {
+                if self
+                    .observability
+                    .addresses
+                    .get(&id)
+                    .is_some_and(|sample| Self::accept_attempt(sample, at))
+                {
+                    self.observability
+                        .addresses
+                        .get_mut(&id)
+                        .unwrap()
+                        .record_success(at, addresses);
+                }
+            }
+            AppEvent::AddressesFailed { id, at, message } => {
+                if self
+                    .observability
+                    .addresses
+                    .get(&id)
+                    .is_some_and(|sample| Self::accept_attempt(sample, at))
+                {
+                    self.observability
+                        .addresses
+                        .get_mut(&id)
+                        .unwrap()
+                        .record_error(at, message);
+                }
+            }
+            AppEvent::Rss { rack, at, observation } => {
+                if self
+                    .deployment
+                    .rss
+                    .get(&rack)
+                    .is_some_and(|sample| Self::accept_attempt(sample, at))
+                {
+                    let sample = self.deployment.rss.get_mut(&rack).unwrap();
+                    sample.record_success(at, observation);
+                }
+            }
+            AppEvent::RssFailed { rack, at, message } => {
+                if self
+                    .deployment
+                    .rss
+                    .get(&rack)
+                    .is_some_and(|sample| Self::accept_attempt(sample, at))
+                {
+                    let sample = self.deployment.rss.get_mut(&rack).unwrap();
+                    sample.record_error(at, message);
+                }
+            }
             AppEvent::DurableLogFailed { message } => self.logs.push_filtered(
                 LogEntry::application(LogLevel::Error, message),
                 self.logs_filter,
@@ -347,6 +478,66 @@ impl App {
         }
         self.clamp_log_scroll();
         effects
+    }
+
+    fn resource_label(&self, id: &ResourceId) -> String {
+        let name = self
+            .deployment
+            .topology
+            .iter()
+            .find(|descriptor| &descriptor.id == id)
+            .map_or(id.name.as_str(), |descriptor| descriptor.name.as_str());
+        format!("{name} {:?}", id.kind).to_lowercase()
+    }
+
+    /// Records monitoring failures in the TUI log as they appear or change,
+    /// and their recovery, so the Monitor view's errors have a durable trail.
+    fn log_monitoring_outcome(
+        &mut self,
+        event: &AppEvent,
+        effects: &mut Vec<Effect>,
+    ) {
+        let rack =
+            |rack: &RackId, what: &str| format!("rack {} {what}", rack.0);
+        let (source, error) = match event {
+            AppEvent::HealthFailed { id, message, .. } => {
+                (format!("{} health", self.resource_label(id)), Some(message))
+            }
+            AppEvent::Health { id, .. } => {
+                (format!("{} health", self.resource_label(id)), None)
+            }
+            AppEvent::AddressesFailed { id, message, .. } => (
+                format!("{} addresses", self.resource_label(id)),
+                Some(message),
+            ),
+            AppEvent::Addresses { id, .. } => {
+                (format!("{} addresses", self.resource_label(id)), None)
+            }
+            AppEvent::RssFailed { rack: r, message, .. } => {
+                (rack(r, "RSS"), Some(message))
+            }
+            AppEvent::Rss { rack: r, .. } => (rack(r, "RSS"), None),
+            _ => return,
+        };
+        let (level, message) = match error {
+            Some(message)
+                if self.logged_monitoring_errors.get(&source)
+                    != Some(message) =>
+            {
+                self.logged_monitoring_errors
+                    .insert(source.clone(), message.clone());
+                (LogLevel::Warning, format!("{source}: {message}"))
+            }
+            None if self.logged_monitoring_errors.remove(&source).is_some() => {
+                (LogLevel::Info, format!("{source}: recovered"))
+            }
+            _ => return,
+        };
+        self.logs.push_filtered(
+            LogEntry::application(level, format!("monitor: {message}")),
+            self.logs_filter,
+        );
+        effects.push(Effect::RecordMonitoring { level, message });
     }
 
     fn action(&mut self, action: Action) -> Vec<Effect> {
@@ -357,7 +548,19 @@ impl App {
                     self.session.confirmation = None;
                     vec![]
                 }
-                (_, Action::Scroll { delta, .. }) => {
+                // Options are buttons in a row, so ←/→ move between them as
+                // well as ↑/↓.
+                (
+                    _,
+                    action @ (Action::Scroll { .. }
+                    | Action::Left
+                    | Action::Right),
+                ) => {
+                    let delta = match action {
+                        Action::Scroll { delta, .. } => delta,
+                        Action::Left => -1,
+                        _ => 1,
+                    };
                     self.session.confirmation_selection = self
                         .session
                         .confirmation_selection
@@ -444,14 +647,107 @@ impl App {
                 _ => vec![],
             };
         }
+        if self.session.detail_open {
+            return match action {
+                Action::Activate | Action::Close => {
+                    self.session.detail_open = false;
+                    vec![]
+                }
+                Action::ToggleHelp => {
+                    self.session.help_open = true;
+                    self.session.help_scroll = 0;
+                    vec![]
+                }
+                Action::Left | Action::Right => {
+                    self.move_resource(if matches!(action, Action::Right) {
+                        Direction::Next
+                    } else {
+                        Direction::Previous
+                    });
+                    self.session.detail_scroll = 0;
+                    vec![]
+                }
+                Action::Scroll { delta, page } => {
+                    let (viewport, limit) =
+                        crate::tui::ui::node_detail::scroll_limits(self);
+                    let amount =
+                        if page { viewport.max(1) } else { 1 } as isize;
+                    self.session.detail_scroll = self
+                        .session
+                        .detail_scroll
+                        .min(limit)
+                        .saturating_add_signed(delta.saturating_mul(amount))
+                        .min(limit);
+                    vec![]
+                }
+                _ => vec![],
+            };
+        }
         match action {
+            Action::ToggleView => self.switch_view(match self.session.view {
+                View::Deployment => View::Monitor,
+                View::Monitor => View::Deployment,
+            }),
+            Action::Left | Action::Right
+                if self.session.view == View::Monitor
+                    && self
+                        .session
+                        .monitoring_expanded(self.session.monitoring_pane) =>
+            {
+                let right = matches!(action, Action::Right);
+                match self.session.monitoring_pane {
+                    MonitoringPane::RackSummary => self.move_rack(if right {
+                        Direction::Next
+                    } else {
+                        Direction::Previous
+                    }),
+                    MonitoringPane::Topology => {
+                        let next = self
+                            .session
+                            .selected_resource
+                            .as_ref()
+                            .and_then(|current| {
+                                crate::tui::ui::topology::horizontal_neighbor(
+                                    &self.scoped_topology(),
+                                    current,
+                                    right,
+                                )
+                            });
+                        if next.is_some() {
+                            self.session.selected_resource = next;
+                        }
+                    }
+                }
+            }
             Action::NextSection => self.move_section(Direction::Next),
             Action::PreviousSection => self.move_section(Direction::Previous),
-            Action::ToggleSection => {
-                let pane = self.session.deployment_pane;
-                if !self.session.collapsed_deployment.remove(&pane) {
-                    self.session.collapsed_deployment.insert(pane);
+            Action::ToggleSection => match self.session.view {
+                View::Deployment => {
+                    let pane = self.session.deployment_pane;
+                    if !self.session.collapsed_deployment.remove(&pane) {
+                        self.session.collapsed_deployment.insert(pane);
+                    }
                 }
+                View::Monitor => {
+                    let pane = self.session.monitoring_pane;
+                    if !self.session.collapsed_monitoring.remove(&pane) {
+                        self.session.collapsed_monitoring.insert(pane);
+                    }
+                }
+            },
+            Action::Activate
+                if self.session.view == View::Monitor
+                    && self.session.monitoring_pane
+                        == MonitoringPane::Topology
+                    && self
+                        .session
+                        .monitoring_expanded(MonitoringPane::Topology)
+                    && self.session.selected_resource.is_some()
+                    && !self.session.help_open
+                    && self.session.confirmation.is_none() =>
+            {
+                self.session.detail_open = true;
+                self.session.detail_scroll = 0;
             }
             Action::ToggleHelp if self.session.confirmation.is_none() => {
                 self.session.help_open = !self.session.help_open;
@@ -459,29 +755,56 @@ impl App {
                     self.session.help_scroll = 0;
                 }
             }
-            Action::RequestLaunch if self.can_start(OperationKind::Launch) => {
+            Action::Close => {
+                if self.session.confirmation.take().is_some() {
+                    return vec![];
+                }
+                if self.session.help_open {
+                    self.session.help_open = false
+                } else if self.session.detail_open {
+                    self.session.detail_open = false
+                } else {
+                    self.session.selected_resource = None
+                }
+            }
+            Action::Reject => self.session.confirmation = None,
+            Action::RequestLaunch
+                if self.session.view == View::Deployment
+                    && self.can_start(OperationKind::Launch) =>
+            {
                 self.open_confirmation(Confirmation::Launch)
             }
-            Action::RequestRoute if self.can_start(OperationKind::Route) => {
+            Action::RequestRoute
+                if self.session.view == View::Deployment
+                    && self.can_start(OperationKind::Route) =>
+            {
                 self.open_confirmation(Confirmation::Route)
             }
             Action::RequestCancelAndDestroy
-                if self.can_cancel()
-                    || self.can_upgrade_cancel_to_destroy() =>
+                if self.session.view == View::Deployment
+                    && (self.can_cancel()
+                        || self.can_upgrade_cancel_to_destroy()) =>
             {
                 self.open_confirmation(Confirmation::CancelAndDestroy)
             }
             // Escalation: once the stop is already in flight, the same key
             // offers the only remaining lever against a child that will not
             // settle.
-            Action::RequestCancelAndDestroy if self.can_force_stop() => {
+            Action::RequestCancelAndDestroy
+                if self.session.view == View::Deployment
+                    && self.can_force_stop() =>
+            {
                 self.open_confirmation(Confirmation::ForceStop)
             }
             Action::CycleLogFilter
-                if self.session.deployment_pane == DeploymentPane::Logs
+                if self.session.view == View::Deployment
+                    && self.session.deployment_pane == DeploymentPane::Logs
                     && self
                         .session
-                        .deployment_expanded(DeploymentPane::Logs) =>
+                        .deployment_expanded(DeploymentPane::Logs)
+                    && !self.session.help_open
+                    && !self.session.detail_open
+                    && self.session.confirmation.is_none() =>
             {
                 self.logs_filter = self.logs_filter.next();
                 self.logs.scroll = 0;
@@ -489,39 +812,40 @@ impl App {
             Action::Scroll { delta, page: false } => {
                 self.move_focused_content(delta);
             }
-            Action::Scroll { delta, page: true }
-                if self
-                    .session
-                    .deployment_expanded(self.session.deployment_pane) =>
-            {
-                match self.session.deployment_pane {
-                    DeploymentPane::OverallProgress
-                    | DeploymentPane::Status
-                    | DeploymentPane::CurrentPhase => {}
-                    DeploymentPane::Phases => {
-                        let amount =
-                            crate::tui::ui::deployment::phase_content_height(
-                                self,
-                            )
-                            .max(1) as isize;
-                        self.session.phase_scroll = self
-                            .session
-                            .phase_scroll
-                            .saturating_add_signed(delta.saturating_mul(amount))
-                    }
-                    DeploymentPane::Logs => {
-                        let visible =
-                            crate::tui::ui::deployment::log_content_height(
-                                self,
+            Action::Scroll { delta, page: true } => match self.session.view {
+                View::Deployment
+                    if self
+                        .session
+                        .deployment_expanded(self.session.deployment_pane) =>
+                {
+                    match self.session.deployment_pane {
+                        DeploymentPane::OverallProgress
+                        | DeploymentPane::Status
+                        | DeploymentPane::CurrentPhase => {}
+                        DeploymentPane::Phases => {
+                            let amount = crate::tui::ui::deployment::phase_content_height(self)
+                                .max(1) as isize;
+                            self.session.phase_scroll =
+                                self.session.phase_scroll.saturating_add_signed(
+                                    delta.saturating_mul(amount),
+                                )
+                        }
+                        DeploymentPane::Logs => {
+                            let visible =
+                                crate::tui::ui::deployment::log_content_height(
+                                    self,
+                                );
+                            let amount = visible.max(1) as isize;
+                            self.logs.scroll(
+                                delta.saturating_mul(amount).saturating_neg(),
+                                visible,
                             );
-                        let amount = visible.max(1) as isize;
-                        self.logs.scroll(
-                            delta.saturating_mul(amount).saturating_neg(),
-                            visible,
-                        );
+                        }
                     }
                 }
-            }
+                View::Deployment => {}
+                View::Monitor => {}
+            },
             _ => {}
         }
         vec![]
@@ -681,6 +1005,35 @@ impl App {
         }
         effects
     }
+    fn racks(&self) -> Vec<RackId> {
+        self.deployment
+            .topology
+            .iter()
+            .filter_map(|d| d.rack)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+    fn scoped_topology(&self) -> Vec<ResourceDescriptor> {
+        self.deployment
+            .topology
+            .iter()
+            .filter(|d| {
+                self.session.view != View::Monitor
+                    || d.rack == self.session.selected_rack
+                    || d.kind == crate::tui::telemetry::ResourceKind::Router
+            })
+            .cloned()
+            .collect()
+    }
+    fn resources(&self) -> Vec<ResourceId> {
+        let descriptors = self.scoped_topology();
+        if self.session.view == View::Monitor {
+            crate::tui::ui::topology::navigation_order(&descriptors)
+        } else {
+            descriptors.into_iter().map(|descriptor| descriptor.id).collect()
+        }
+    }
     fn moved<T: Clone + Eq>(
         items: &[T],
         current: Option<&T>,
@@ -705,71 +1058,176 @@ impl App {
             .clone(),
         )
     }
+    fn move_rack(&mut self, direction: Direction) {
+        self.session.selected_rack = Self::moved(
+            &self.racks(),
+            self.session.selected_rack.as_ref(),
+            direction,
+        );
+        self.repair_resource();
+    }
+    fn move_resource(&mut self, direction: Direction) {
+        self.session.selected_resource = Self::moved(
+            &self.resources(),
+            self.session.selected_resource.as_ref(),
+            direction,
+        );
+    }
     fn move_focused_content(&mut self, delta: isize) {
-        if delta == 0
-            || !self.session.deployment_expanded(self.session.deployment_pane)
-        {
+        if delta == 0 {
             return;
         }
-        match self.session.deployment_pane {
-            DeploymentPane::Phases => {
-                let Some(operation) = self.operation.active.as_ref() else {
-                    return;
+        match self.session.view {
+            View::Deployment
+                if self
+                    .session
+                    .deployment_expanded(self.session.deployment_pane) =>
+            {
+                match self.session.deployment_pane {
+                    DeploymentPane::Phases => {
+                        let Some(operation) = self.operation.active.as_ref()
+                        else {
+                            return;
+                        };
+                        let phases = crate::tui::ui::deployment::phase_order(
+                            operation.kind,
+                        );
+                        if phases.is_empty() {
+                            return;
+                        }
+                        let visible =
+                            crate::tui::ui::deployment::phase_content_height(
+                                self,
+                            );
+                        let active = operation.phase.and_then(|phase| {
+                            phases.iter().position(|item| *item == phase)
+                        });
+                        let current =
+                            crate::tui::ui::deployment::phase_window_start(
+                                self.session.phase_scroll,
+                                visible,
+                                phases.len(),
+                                active,
+                            );
+                        let candidate =
+                            crate::tui::ui::deployment::phase_window_start(
+                                current.saturating_add_signed(delta),
+                                visible,
+                                phases.len(),
+                                active,
+                            );
+                        self.session.phase_scroll = candidate;
+                    }
+                    DeploymentPane::CurrentPhase => {}
+                    DeploymentPane::Logs => {
+                        let visible =
+                            crate::tui::ui::deployment::log_content_height(
+                                self,
+                            );
+                        let len = crate::tui::ui::logs::filtered_len(self);
+                        if len == 0 {
+                            return;
+                        }
+                        let current = crate::tui::ui::logs::effective_scroll(
+                            self.logs.scroll,
+                            len,
+                            visible,
+                        );
+                        let candidate = crate::tui::ui::logs::effective_scroll(
+                            current
+                                .saturating_add_signed(delta.saturating_neg()),
+                            len,
+                            visible,
+                        );
+                        self.logs.scroll = candidate;
+                    }
+                    DeploymentPane::OverallProgress
+                    | DeploymentPane::Status => {}
+                }
+            }
+            View::Monitor
+                if self.session.monitoring_pane == MonitoringPane::Topology
+                    && self
+                        .session
+                        .monitoring_expanded(MonitoringPane::Topology) =>
+            {
+                let next = match self.session.selected_resource.as_ref() {
+                    Some(current) => {
+                        crate::tui::ui::topology::vertical_neighbor(
+                            &self.scoped_topology(),
+                            current,
+                            delta > 0,
+                        )
+                    }
+                    None => {
+                        let resources = self.resources();
+                        if delta < 0 {
+                            resources.last().cloned()
+                        } else {
+                            resources.first().cloned()
+                        }
+                    }
                 };
-                let phases =
-                    crate::tui::ui::deployment::phase_order(operation.kind);
-                if phases.is_empty() {
-                    return;
+                if next.is_some() {
+                    self.session.selected_resource = next;
                 }
-                let visible =
-                    crate::tui::ui::deployment::phase_content_height(self);
-                let active = operation.phase.and_then(|phase| {
-                    phases.iter().position(|item| *item == phase)
-                });
-                let current = crate::tui::ui::deployment::phase_window_start(
-                    self.session.phase_scroll,
-                    visible,
-                    phases.len(),
-                    active,
-                );
-                let candidate = crate::tui::ui::deployment::phase_window_start(
-                    current.saturating_add_signed(delta),
-                    visible,
-                    phases.len(),
-                    active,
-                );
-                self.session.phase_scroll = candidate;
             }
-            DeploymentPane::CurrentPhase => {}
-            DeploymentPane::Logs => {
-                let visible =
-                    crate::tui::ui::deployment::log_content_height(self);
-                let len = crate::tui::ui::logs::filtered_len(self);
-                if len == 0 {
-                    return;
-                }
-                let current = crate::tui::ui::logs::effective_scroll(
-                    self.logs.scroll,
-                    len,
-                    visible,
-                );
-                let candidate = crate::tui::ui::logs::effective_scroll(
-                    current.saturating_add_signed(delta.saturating_neg()),
-                    len,
-                    visible,
-                );
-                self.logs.scroll = candidate;
-            }
-            DeploymentPane::OverallProgress | DeploymentPane::Status => {}
+            _ => {}
         }
     }
     fn move_section(&mut self, direction: Direction) {
-        self.session.deployment_pane = Self::moved(
-            &DeploymentPane::ORDER,
-            Some(&self.session.deployment_pane),
-            direction,
-        )
-        .unwrap();
+        match self.session.view {
+            View::Deployment => {
+                self.session.deployment_pane = Self::moved(
+                    &DeploymentPane::ORDER,
+                    Some(&self.session.deployment_pane),
+                    direction,
+                )
+                .unwrap();
+            }
+            View::Monitor => {
+                self.session.monitoring_pane = Self::moved(
+                    &MonitoringPane::ORDER,
+                    Some(&self.session.monitoring_pane),
+                    direction,
+                )
+                .unwrap();
+            }
+        }
+    }
+    fn switch_view(&mut self, view: View) {
+        self.session.view = view;
+        if view == View::Deployment {
+            self.session.detail_open = false;
+        }
+        self.repair_selection();
+    }
+    fn repair_selection(&mut self) {
+        let racks = self.racks();
+        if self
+            .session
+            .selected_rack
+            .as_ref()
+            .is_none_or(|r| !racks.contains(r))
+        {
+            self.session.selected_rack = racks.first().copied();
+        }
+        self.repair_resource();
+    }
+    fn repair_resource(&mut self) {
+        let resources = self.resources();
+        if self
+            .session
+            .selected_resource
+            .as_ref()
+            .is_none_or(|r| !resources.contains(r))
+        {
+            self.session.selected_resource = resources.first().cloned();
+        }
+        if resources.is_empty() {
+            self.session.selected_resource = None;
+            self.session.detail_open = false;
+        }
     }
     fn filtered_log_count(&self) -> usize {
         self.logs
@@ -941,6 +1399,25 @@ impl App {
             .as_mut()
             .filter(|active| active.request_id == request_id)
     }
+
+    fn accept_attempt<T>(sample: &LatestSample<T>, at: Instant) -> bool {
+        sample.last_attempt.is_none_or(|latest| at >= latest)
+            && sample.good.as_ref().is_none_or(|good| at >= good.captured_at)
+    }
+
+    fn normalize_topology(
+        mut topology: Vec<ResourceDescriptor>,
+    ) -> Vec<ResourceDescriptor> {
+        topology.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| a.rack.cmp(&b.rack))
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.host.cmp(&b.host))
+        });
+        topology.dedup_by(|a, b| a.id == b.id);
+        topology
+    }
 }
 
 fn command_succeeded(outcome: &CommandOutcome) -> bool {
@@ -953,7 +1430,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     fn active_app() -> App {
-        let mut app = App::new(8);
+        let mut app = App::new(vec![], 8);
         app.operation.active = Some(ActiveOperation::new(
             OperationRequestId::FIRST,
             OperationKind::Launch,
@@ -968,10 +1445,10 @@ mod tests {
         }
     }
 
-    /// Chooses an open confirmation's affirmative option, which sits just
-    /// above the Back or Cancel option every dialog starts on.
+    /// Chooses an open confirmation's affirmative option, the button just
+    /// left of the Back or Cancel button every dialog starts on.
     fn confirm(app: &mut App) -> Vec<Effect> {
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
+        app.update(AppEvent::Action(Action::Left));
         app.update(AppEvent::Action(Action::Activate))
     }
 
@@ -984,6 +1461,56 @@ mod tests {
             request_id,
             event: OperationEvent::Finished(outcome),
         })
+    }
+
+    #[test]
+    fn monitoring_errors_are_logged_once_and_on_recovery() {
+        let rack = RackId(0);
+        let at = Instant::now();
+        let unreachable = |message: &str| AppEvent::RssFailed {
+            rack,
+            at,
+            message: message.into(),
+        };
+        let initialized = || AppEvent::Rss {
+            rack,
+            at,
+            observation: RssObservation::Initialized { id: "rack".into() },
+        };
+        let mut app = App::new(vec![], 8);
+
+        let recorded = [
+            unreachable("connect refused"),
+            unreachable("connect refused"),
+            unreachable("timed out"),
+            initialized(),
+            initialized(),
+        ]
+        .into_iter()
+        .flat_map(|event| app.update(event))
+        .filter_map(|effect| match effect {
+            Effect::RecordMonitoring { level, message } => {
+                Some((level, message))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            recorded,
+            [
+                (LogLevel::Warning, "rack 0 RSS: connect refused".to_owned()),
+                (LogLevel::Warning, "rack 0 RSS: timed out".to_owned()),
+                (LogLevel::Info, "rack 0 RSS: recovered".to_owned()),
+            ]
+        );
+        // The Deployment view's log pane carries the same trail.
+        assert!(
+            app.logs
+                .entries
+                .iter()
+                .any(|entry| entry.message == "monitor: rack 0 RSS: timed out")
+        );
     }
 
     #[test]
@@ -1047,7 +1574,7 @@ mod tests {
         let cases = [
             (
                 "quit and destroy",
-                App::new(8),
+                App::new(vec![], 8),
                 Action::RequestQuit,
                 Confirmation::QuitAndDestroy,
             ),
@@ -1065,6 +1592,7 @@ mod tests {
             ),
         ];
         for (case, mut app, request, confirmation) in cases {
+            app.session.view = View::Deployment;
             app.update(AppEvent::Action(request));
             assert_eq!(app.session.confirmation, Some(confirmation), "{case}");
 
