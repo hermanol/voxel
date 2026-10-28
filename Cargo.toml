@@ -16,8 +16,11 @@ wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/om
 wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
 # Unnumbered BGP peer type rack-init-config does not re-export yet.
 sled-agent-types = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
+# Nexus external API client for TUI monitoring.
+oxide-client = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
+httptest = "0.16.4"
 tempfile = "3.27.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
 # tokio features (they're additive), so we don't need "full".
@@ -36,6 +39,7 @@ serde = "1"
 camino = { version = "1.2.2", features = ["serde1"] }
 indoc = "2.0.7"
 toml_edit = "0.25"
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "rustls"] }
 
 # sprockets/trust quorum related deps
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }

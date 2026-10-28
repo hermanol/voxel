@@ -12,8 +12,10 @@ use crossterm::event::KeyCode;
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer};
 use voxel_config::VoxelConfig;
 
+use super::nexus::RecoveryLogin;
 use super::telemetry::{
     BidirectionalRate, RackId, ResourceDescriptor, ResourceId, ResourceKind,
+    TrafficSample, TrafficSource,
 };
 
 /// Parse a `voxel.toml` snippet, written as a user would write it.
@@ -61,6 +63,27 @@ pub(crate) fn router(name: &str) -> ResourceDescriptor {
 
 pub(crate) fn rate(rx_bytes_sec: f64, tx_bytes_sec: f64) -> BidirectionalRate {
     BidirectionalRate { rx_bytes_sec, tx_bytes_sec, ..Default::default() }
+}
+
+/// A traffic sample whose only nonzero figure is its received bytes.
+pub(crate) fn sample(
+    rx_bytes_sec: f64,
+    source: TrafficSource,
+) -> TrafficSample {
+    TrafficSample {
+        total: rate(rx_bytes_sec, 0.0),
+        source,
+        ..Default::default()
+    }
+}
+
+/// The default recovery identity Voxel's racks are set up with.
+pub(crate) fn recovery() -> RecoveryLogin {
+    RecoveryLogin {
+        silo: "recovery".into(),
+        username: "recovery".into(),
+        password: "oxide".into(),
+    }
 }
 
 /// The keys a footer or help label names, such as `"↑/↓"` or

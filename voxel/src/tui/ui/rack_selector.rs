@@ -6,20 +6,24 @@
 //! and health at a glance.
 
 use super::{
+    colors::OX_RED,
     monitor::{resource_health_state, sparkline_data},
     widgets::{format_rate, section_block, selection_style, traffic_style},
 };
 use crate::{
     tui::reconcile::ObservedDeploymentState,
-    tui::reconcile::RssObservation,
+    tui::reconcile::{RouteEvidence, RssObservation},
     tui::{
         App,
-        telemetry::{Freshness, HealthState, LatestSample, TrafficSeverity},
+        telemetry::{
+            Freshness, HealthState, LatestSample, OximeterExceptions,
+            TrafficSeverity,
+        },
     },
 };
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::Line,
     widgets::{Paragraph, Sparkline},
 };
@@ -87,6 +91,37 @@ pub fn draw(
         .get(&rack)
         .map(|sample| rss_summary(app, sample))
         .unwrap_or_else(|| "RSS unavailable (no sample)".into());
+    let zfs = app
+        .observability
+        .zfs_headroom
+        .get(&rack)
+        .and_then(|sample| sample.good.as_ref())
+        .map(|sample| {
+            let available: u64 =
+                sample.value.iter().map(|pool| pool.available_bytes()).sum();
+            let total: u64 =
+                sample.value.iter().map(|pool| pool.total_bytes).sum();
+            format!(
+                "ZFS {:.1}/{:.1} GiB free",
+                available as f64 / 1024.0_f64.powi(3),
+                total as f64 / 1024.0_f64.powi(3)
+            )
+        })
+        .unwrap_or_else(|| "ZFS —".into());
+    let exceptions = app
+        .observability
+        .oximeter_exceptions
+        .get(&rack)
+        .and_then(|sample| sample.good.as_ref())
+        .map(|sample| {
+            format!(
+                "Oximeter collection health, last {}m: {} failures / {} dropped",
+                OximeterExceptions::WINDOW.as_secs() / 60,
+                sample.value.failed_collections,
+                sample.value.dropped_samples
+            )
+        })
+        .unwrap_or_else(|| "Oximeter collection health unavailable".into());
     let compact = area.width < 100;
     let title =
         format!(" Rack {} ◀ {}/{} ▶ ", rack.0, selected_index + 1, racks.len());
@@ -104,16 +139,51 @@ pub fn draw(
             inner.width,
             inner.height.saturating_sub(1),
         ));
+    if let Some(error) = app
+        .observability
+        .nexus
+        .get(&rack)
+        .and_then(|sample| sample.latest_error.as_ref())
+    {
+        // A missing host route is the usual reason this host cannot reach
+        // Nexus, and the raw connect error does not say so.
+        let cause = if matches!(
+            app.deployment.routes,
+            RouteEvidence::Applied | RouteEvidence::NotRequired
+        ) {
+            "Oximeter traffic, CPU, ZFS, collector health may be stale"
+        } else {
+            "No host route to the rack's external network is confirmed \
+             (r in Deployment applies it)"
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "⚠ Nexus/control plane unavailable · direct-probe fallback enabled · log: {}",
+                    app.durable_log_path
+                )),
+                Line::from(format!("{cause} · {}", error.message)),
+            ])
+            .style(Style::default().fg(OX_RED).add_modifier(Modifier::BOLD)),
+            Rect::new(
+                rows[0].x,
+                rows[0].y,
+                rows[0].width,
+                rows[0].height.saturating_add(rows[1].height),
+            ),
+        );
+        return;
+    }
     let rate_text = if compact {
         format!(
-            "RX {} TX {} Σ{} · {healthy}/{unhealthy}/{checking}",
+            "RX {} TX {} Σ{} · {healthy}/{unhealthy}/{checking} · {zfs} · {exceptions}",
             format_rate(rate.rx_bytes_sec),
             format_rate(rate.tx_bytes_sec),
             format_rate(rate.total_bytes_sec())
         )
     } else {
         format!(
-            "RX {} · TX {} · Total {} · health {healthy} ok / {unhealthy} bad / {checking} checking",
+            "RX {} · TX {} · Total {} · health {healthy} ok / {unhealthy} bad / {checking} checking · {zfs} · {exceptions}",
             format_rate(rate.rx_bytes_sec),
             format_rate(rate.tx_bytes_sec),
             format_rate(rate.total_bytes_sec())

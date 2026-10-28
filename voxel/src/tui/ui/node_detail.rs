@@ -271,6 +271,23 @@ fn detail_text(
                     rate.rx_packets_sec, rate.tx_packets_sec
                 )),
             ));
+            let errors = &traffic.current_sample.errors;
+            let error_span = format!(
+                "RX {:.2}/s · TX {:.2}/s",
+                errors.rx_sec, errors.tx_sec
+            );
+            lines.push(item(
+                "Link errors",
+                if errors.rx_sec > 0.0 || errors.tx_sec > 0.0 {
+                    warn(error_span)
+                } else {
+                    ok(error_span)
+                },
+            ));
+            lines.push(item(
+                "Source",
+                ok(traffic.current_sample.source.label()),
+            ));
             let label = format!("{BULLET}History: ");
             let data = sparkline_data(
                 traffic
@@ -355,6 +372,82 @@ fn detail_text(
         None => lines.push(item("Status", warn("no successful sample"))),
     }
 
+    let mut errors = Vec::new();
+    if let Some(rack) = descriptor.rack {
+        if let Some(pools) = app
+            .observability
+            .zfs_headroom
+            .get(&rack)
+            .and_then(|sample| sample.good.as_ref())
+        {
+            let pools = pools
+                .value
+                .iter()
+                .filter(|pool| pool.id == *id)
+                .collect::<Vec<_>>();
+            if !pools.is_empty() {
+                lines.push(Line::default());
+                lines.push(heading("Storage"));
+                for pool in pools {
+                    lines.push(item(
+                        &pool.pool,
+                        ok(format!(
+                            "{:.1} of {:.1} GiB free",
+                            pool.available_bytes() as f64 / 1024.0_f64.powi(3),
+                            pool.total_bytes as f64 / 1024.0_f64.powi(3)
+                        )),
+                    ));
+                }
+            }
+        }
+        if let Some(cpu) = app
+            .observability
+            .zone_cpu
+            .get(&rack)
+            .and_then(|sample| sample.good.as_ref())
+        {
+            let zones = cpu
+                .value
+                .iter()
+                .filter(|zone| zone.id == *id)
+                .collect::<Vec<_>>();
+            if !zones.is_empty() {
+                lines.push(Line::default());
+                lines.push(heading("Zone CPU"));
+                for zone in zones {
+                    lines.push(item(
+                        &zone.name,
+                        ok(format!(
+                            "{:.1}% · wait {:.1}%",
+                            zone.total_percent(),
+                            zone.wait_percent
+                        )),
+                    ));
+                }
+            }
+        }
+        for (label, error) in [
+            (
+                "Zone CPU unavailable",
+                app.observability
+                    .zone_cpu
+                    .get(&rack)
+                    .and_then(|sample| sample.latest_error.as_ref()),
+            ),
+            (
+                "ZFS unavailable",
+                app.observability
+                    .zfs_headroom
+                    .get(&rack)
+                    .and_then(|sample| sample.latest_error.as_ref()),
+            ),
+        ] {
+            if let Some(error) = error {
+                errors.push((label, error.message.clone()));
+            }
+        }
+    }
+
     let mut zones = traffic
         .into_iter()
         .flat_map(|traffic| traffic.current_sample.zones.iter())
@@ -389,7 +482,6 @@ fn detail_text(
         }
     }
 
-    let mut errors = Vec::new();
     if let Some(error) = app
         .observability
         .health

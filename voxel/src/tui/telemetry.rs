@@ -183,6 +183,28 @@ pub struct BidirectionalRate {
     pub tx_packets_sec: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BidirectionalErrors {
+    pub rx_sec: f64,
+    pub tx_sec: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub enum TrafficSource {
+    Oximeter,
+    #[default]
+    DirectProbe,
+}
+
+impl TrafficSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Oximeter => "Oximeter",
+            Self::DirectProbe => "direct probe",
+        }
+    }
+}
+
 impl BidirectionalRate {
     pub fn total_bytes_sec(self) -> f64 {
         self.rx_bytes_sec + self.tx_bytes_sec
@@ -210,13 +232,69 @@ pub struct ZoneTraffic {
     pub name: String,
     pub short_name: String,
     pub rate: BidirectionalRate,
+    pub errors: BidirectionalErrors,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficSample {
     pub total: BidirectionalRate,
     pub links: BTreeMap<String, BidirectionalRate>,
     pub zones: Vec<ZoneTraffic>,
+    pub errors: BidirectionalErrors,
+    pub source: TrafficSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneCpu {
+    pub id: ResourceId,
+    pub name: String,
+    pub kind: String,
+    pub user_percent: f64,
+    pub system_percent: f64,
+    pub wait_percent: f64,
+}
+
+impl ZoneCpu {
+    pub fn total_percent(&self) -> f64 {
+        self.user_percent + self.system_percent
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZfsHeadroom {
+    pub id: ResourceId,
+    pub pool: String,
+    pub allocated_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl ZfsHeadroom {
+    pub fn available_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.allocated_bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OximeterExceptions {
+    pub failed_collections: u64,
+    pub dropped_samples: u64,
+}
+
+impl OximeterExceptions {
+    /// The recent period the counts cover.
+    pub const WINDOW: Duration = Duration::from_secs(5 * 60);
+}
+
+impl Default for TrafficSample {
+    fn default() -> Self {
+        Self {
+            total: Default::default(),
+            links: Default::default(),
+            zones: Default::default(),
+            errors: Default::default(),
+            source: TrafficSource::DirectProbe,
+        }
+    }
 }
 
 impl From<BidirectionalRate> for TrafficSample {
@@ -294,6 +372,7 @@ impl ResourceTelemetry {
                     name: zone.name.clone(),
                     short_name: zone.short_name.clone(),
                     rate,
+                    errors: Default::default(),
                 }
             })
             .collect();
@@ -428,6 +507,28 @@ impl TelemetryModel {
         }
     }
 
+    pub fn set_oximeter_samples(
+        &mut self,
+        id: &ResourceId,
+        generation: Instant,
+        samples: impl IntoIterator<Item = (Instant, TrafficSample)>,
+    ) {
+        let Some(resource) = self.resources.get_mut(id) else {
+            return;
+        };
+        for (captured_at, sample) in samples {
+            resource.current_rate = sample.total;
+            resource.current_sample = sample;
+            resource.history.push(HistoryPoint {
+                captured_at,
+                rate: resource.current_rate,
+            });
+        }
+        if resource.current_sample.source == TrafficSource::Oximeter {
+            resource.current_at = Some(generation);
+        }
+    }
+
     #[cfg(test)]
     pub fn set_current_rate(
         &mut self,
@@ -438,16 +539,30 @@ impl TelemetryModel {
         self.set_current_sample(id, now, rate.into());
     }
 
+    /// Totals the resources whose rate came from the latest generation of
+    /// their rack and source. Oximeter reports each rack at its own time
+    /// while direct probes, including those of routers, which belong to no
+    /// rack, run on their own cadence, so the latest generation overall would
+    /// leave every other rack and source out.
     pub fn rebuild_aggregates(&mut self, now: Instant) {
+        let scope = |resource: &ResourceState| {
+            (resource.descriptor.rack, resource.current_sample.source)
+        };
+        let mut latest = BTreeMap::new();
+        for resource in self.resources.values() {
+            if let Some(at) = resource.current_at {
+                let generation = latest.entry(scope(resource)).or_insert(at);
+                *generation = (*generation).max(at);
+            }
+        }
         self.fleet_rate = Default::default();
         for rate in self.rack_rates.values_mut() {
             *rate = Default::default();
         }
-        for resource in self
-            .resources
-            .values()
-            .filter(|resource| resource.current_at == Some(now))
-        {
+        for resource in self.resources.values().filter(|resource| {
+            resource.current_at.is_some()
+                && resource.current_at == latest.get(&scope(resource)).copied()
+        }) {
             self.fleet_rate += resource.current_rate;
             if let Some(rack) = resource.descriptor.rack {
                 *self.rack_rates.entry(rack).or_default() +=
@@ -923,7 +1038,9 @@ impl<T> LatestSample<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_support::{config, rate, router, sled, switch};
+    use crate::tui::test_support::{
+        config, rate, router, sample, sled, switch,
+    };
     use indoc::indoc;
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
@@ -1181,12 +1298,12 @@ mod tests {
         }
 
         // Fleet and rack totals count each current resource once.
-        let cfg = config(indoc! {"
+        let cfg = config(indoc! {r#"
             [topology]
             racks = 2
             sleds = 3
-            routers = []
-        "});
+            routers = ["ce"]
+        "#});
         let mut model = TelemetryModel::new(resource_descriptors(&cfg), 64);
         let sled0 = sled(0, 0).id;
         model.set_current_rate(&sled0, start, rate(10.0, 20.0));
@@ -1207,6 +1324,22 @@ mod tests {
         model.rebuild_aggregates(next);
         assert_eq!(model.fleet_rate, rate(4.0, 0.0));
         assert_eq!(model.fleet_history.len(), 2, "one point per generation");
+        // Oximeter reports the sled at its own time, and a router, which
+        // belongs to no rack, is probed later still. Neither generation leaves
+        // the other's rate, or the switch's, out of the totals.
+        let oximeter = next + Duration::from_secs(1);
+        model.set_oximeter_samples(
+            &sled0,
+            oximeter,
+            [(oximeter, sample(4.0, TrafficSource::Oximeter))],
+        );
+        model.rebuild_aggregates(oximeter);
+        let probed = oximeter + Duration::from_secs(1);
+        model.set_current_rate(&switch(0, 0, "g0").id, probed, rate(1.0, 0.0));
+        model.set_current_rate(&router("ce").id, probed, rate(2.0, 0.0));
+        model.rebuild_aggregates(probed);
+        assert_eq!(model.rack_rates[&RackId(0)], rate(5.0, 0.0));
+        assert_eq!(model.fleet_rate, rate(7.0, 0.0));
 
         // Top zones rank by rate; a vnic listed twice counts once, and one
         // shared between zones counts for neither.
