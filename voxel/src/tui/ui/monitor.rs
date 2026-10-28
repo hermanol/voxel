@@ -3,12 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The Monitor view. Lays out the rack summary, topology and node details,
-//! and derives node health and its freshness from collected telemetry.
+//! and derives health and traffic freshness from collected telemetry.
 
 use super::{
     colors::{OX_RED, TUI_GREEN, TUI_GREY, TUI_GREY_DARK, TUI_YELLOW},
     renderer::LayoutMode,
-    widgets::{section_block, section_heights, section_rects},
+    widgets::{
+        format_rate, section_block, section_heights, section_rects,
+        traffic_style,
+    },
 };
 use crate::{
     tui::reconcile::ObservedDeploymentState,
@@ -16,18 +19,22 @@ use crate::{
         App,
         event::MonitoringPane,
         telemetry::{
-            Freshness, HealthContext, HealthState, LatestSample,
-            ResourceDescriptor, ResourceId, ResourceKind, derive_health_state,
+            BidirectionalRate, Freshness, HealthContext, HealthState,
+            LatestSample, ResourceDescriptor, ResourceId, ResourceKind,
+            TrafficSeverity, derive_health_state,
         },
     },
 };
 use ratatui::{
-    layout::Rect,
-    style::Style,
-    widgets::{Block, Paragraph},
+    layout::{Alignment, Constraint, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Cell, Paragraph, Row, Table},
 };
 use std::time::Duration;
 
+const TRAFFIC_STALE_AFTER: Duration = Duration::from_secs(15);
+const TRAFFIC_UNAVAILABLE_AFTER: Duration = Duration::from_secs(60);
 // A sled health probe performs four serial calls, each with a ten-second
 // timeout. Keep a successful sample healthy through one slow probe cycle.
 const HEALTH_STALE_AFTER: Duration = Duration::from_secs(60);
@@ -48,6 +55,7 @@ pub fn draw(
         app.session.monitoring_expanded(MonitoringPane::RackSummary),
     );
     draw_topology(frame, rows[1], app, mode);
+    draw_top_zones(frame, rows[2], app, app.session.selected_rack);
 }
 
 pub(crate) fn monitor_rows(
@@ -56,18 +64,18 @@ pub(crate) fn monitor_rows(
     mode: LayoutMode,
 ) -> Vec<Rect> {
     let mut preferred = match (mode, area.height) {
-        (LayoutMode::Wide, 0..=17) => [4, 3],
-        (LayoutMode::Wide, _) => [5, 12],
-        (LayoutMode::Compact, 0..=11) => [3, 3],
-        (LayoutMode::Compact, _) => [4, 8],
-        (LayoutMode::Minimum, _) => [1, 1],
+        (LayoutMode::Wide, 0..=17) => [4, 3, 3],
+        (LayoutMode::Wide, _) => [5, 12, 7],
+        (LayoutMode::Compact, 0..=11) => [3, 3, 2],
+        (LayoutMode::Compact, _) => [4, 8, 3],
+        (LayoutMode::Minimum, _) => [1, 1, 1],
     };
     // The rack elevation needs far more rows than a summary does, so the
     // Topology section claims them while it has focus, short of the rack
     // summary's rows: those carry the rack's control-plane error banner.
     if app.session.monitoring_pane == MonitoringPane::Topology {
         preferred[1] = (super::topology::PREFERRED_HEIGHT + 2)
-            .min(area.height.saturating_sub(preferred[0]));
+            .min(area.height.saturating_sub(preferred[0] + 1));
     }
     let expanded =
         MonitoringPane::ORDER.map(|pane| app.session.monitoring_expanded(pane));
@@ -80,7 +88,7 @@ pub(crate) fn monitor_rows(
         &expanded,
         focused,
         &preferred,
-        &[0, 2],
+        &[0, 2, 1],
         1,
     );
     section_rects(area, &heights)
@@ -137,10 +145,10 @@ pub(crate) fn resource_health_state(app: &App, id: &ResourceId) -> HealthState {
     let kind = resource_kind(app, id);
     if kind != Some(ResourceKind::Sled) {
         // Switch zones and routers report no service diagnostics, so their
-        // health is whether their address probe still answers.
+        // health is whether their traffic probe still answers.
         return app
             .observability
-            .addresses
+            .traffic_failures
             .get(id)
             .map(|sample| collection_health_state(app, sample))
             .unwrap_or(HealthState::Unavailable);
@@ -184,7 +192,8 @@ fn collection_health_state<T>(
     if sample.good.is_none() && sample.last_attempt.is_none() {
         return HealthState::Checking;
     }
-    match sample.freshness(now, HEALTH_STALE_AFTER, HEALTH_UNAVAILABLE_AFTER) {
+    match sample.freshness(now, TRAFFIC_STALE_AFTER, TRAFFIC_UNAVAILABLE_AFTER)
+    {
         Freshness::Fresh => HealthState::Healthy,
         Freshness::Stale => HealthState::Stale,
         Freshness::Unavailable => HealthState::Unavailable,
@@ -208,7 +217,7 @@ fn resource_last_success(
             sample.good.as_ref().map(|good| good.captured_at)
         })
     } else {
-        last_good(app.observability.addresses.get(id))
+        last_good(app.observability.traffic_failures.get(id))
     }
 }
 
@@ -245,11 +254,7 @@ pub(crate) fn resource_health_summary(app: &App, id: &ResourceId) -> String {
             .get(id)
             .and_then(|sample| sample.latest_error.as_ref())
     } else {
-        app.observability
-            .addresses
-            .get(id)
-            .and_then(|sample| sample.latest_error.as_ref())
-            .filter(|error| collection_error_is_visible(app, id, error))
+        visible_traffic_error(app, id)
     }
     .map(|error| format!("; latest error: {}", error.message))
     .unwrap_or_default();
@@ -257,6 +262,15 @@ pub(crate) fn resource_health_summary(app: &App, id: &ResourceId) -> String {
         "{} (last success {age}){error}",
         health_status_label(resource_health_state(app, id))
     )
+}
+
+pub(crate) fn visible_traffic_error<'a>(
+    app: &'a App,
+    id: &ResourceId,
+) -> Option<&'a crate::tui::telemetry::CollectionError> {
+    let error =
+        app.observability.traffic_failures.get(id)?.latest_error.as_ref()?;
+    collection_error_is_visible(app, id, error).then_some(error)
 }
 
 pub(crate) fn collection_error_is_visible(
@@ -285,6 +299,20 @@ pub(crate) fn health_style(state: HealthState) -> Style {
         | HealthState::Unavailable
         | HealthState::Stopped => TUI_GREY_DARK,
     })
+}
+
+pub(crate) fn sparkline_data(
+    values: impl DoubleEndedIterator<Item = f64>,
+    width: u16,
+) -> Vec<u64> {
+    values
+        .rev()
+        .take(width as usize)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|value| value.max(0.0).min(u64::MAX as f64) as u64)
+        .collect()
 }
 
 fn draw_topology(
@@ -342,6 +370,25 @@ pub(crate) fn scoped_descriptors(
         .collect()
 }
 
+pub(crate) fn top_zones_len(
+    app: &App,
+    rack: Option<crate::tui::telemetry::RackId>,
+) -> usize {
+    app.observability
+        .telemetry
+        .resources
+        .values()
+        .filter(|state| monitor_scope_contains(app, rack, &state.descriptor))
+        .map(|state| state.current_sample.zones.len())
+        .sum()
+}
+
+pub(crate) fn top_zones_page_capacity(app: &App) -> usize {
+    let (area, mode) = super::widgets::content_area(app);
+    let height = monitor_rows(area, app, mode)[2].height;
+    if height == 3 { 1 } else { usize::from(height.saturating_sub(3)) }
+}
+
 fn monitor_scope_contains(
     app: &App,
     rack: Option<crate::tui::telemetry::RackId>,
@@ -352,14 +399,152 @@ fn monitor_scope_contains(
         || app.session.selected_resource.as_ref() == Some(&descriptor.id)
 }
 
+pub(crate) fn rate_line(rate: BidirectionalRate) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("RX {} ", format_rate(rate.rx_bytes_sec)),
+            traffic_style(TrafficSeverity::for_bytes_per_sec(
+                rate.rx_bytes_sec,
+            )),
+        ),
+        Span::styled(
+            format!("TX {} ", format_rate(rate.tx_bytes_sec)),
+            traffic_style(TrafficSeverity::for_bytes_per_sec(
+                rate.tx_bytes_sec,
+            )),
+        ),
+        Span::styled(
+            format!("Total {}", format_rate(rate.total_bytes_sec())),
+            traffic_style(TrafficSeverity::for_bytes_per_sec(
+                rate.total_bytes_sec(),
+            )),
+        ),
+    ])
+}
+
+fn draw_top_zones(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    rack: Option<crate::tui::telemetry::RackId>,
+) {
+    let expanded = app.session.monitoring_expanded(MonitoringPane::TopZones);
+    let mut zones = app
+        .observability
+        .telemetry
+        .resources
+        .values()
+        .filter(|state| monitor_scope_contains(app, rack, &state.descriptor))
+        .flat_map(|state| {
+            state.current_sample.zones.iter().map(move |zone| {
+                (&state.descriptor.id, &state.descriptor.name, zone)
+            })
+        })
+        .collect::<Vec<_>>();
+    zones.sort_by(|(_, ra, a), (_, rb, b)| {
+        b.rate
+            .total_bytes_sec()
+            .total_cmp(&a.rate.total_bytes_sec())
+            .then_with(|| ra.cmp(rb))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let capacity = if area.height == 3 {
+        1
+    } else {
+        usize::from(area.height.saturating_sub(3))
+    };
+    let start = app
+        .session
+        .top_zones_scroll
+        .min(zones.len().saturating_sub(capacity.max(1)));
+    let end = start.saturating_add(capacity).min(zones.len());
+    let title = if capacity > 0 && zones.len() > capacity {
+        format!("Top Zones by Traffic {}-{end} of {}", start + 1, zones.len())
+    } else {
+        "Top Zones by Traffic".into()
+    };
+    let block = section_block(
+        title,
+        expanded,
+        app.session.monitoring_pane == MonitoringPane::TopZones,
+    );
+    frame.render_widget(block.clone(), area);
+    if !expanded || block.inner(area).height == 0 {
+        return;
+    }
+    if area.height == 3 {
+        let sample = zones
+            .get(start)
+            .map(|(_, resource, zone)| {
+                format!(
+                    "{resource} · {} · {}",
+                    zone.short_name,
+                    format_rate(zone.rate.total_bytes_sec())
+                )
+            })
+            .unwrap_or_else(|| "No zone samples".into());
+        frame.render_widget(Paragraph::new(sample).block(block), area);
+        return;
+    }
+    let header = Row::new(["Resource", "Zone", "Total"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = zones
+        .iter()
+        .skip(start)
+        .take(capacity)
+        .map(|(_, resource, zone)| {
+            let rates = zone_rate_cells(zone.rate);
+            Row::new([
+                Cell::from((*resource).clone()),
+                Cell::from(zone.short_name.clone()),
+                rates[2].clone(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if zones.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No zone samples").block(block),
+            area,
+        );
+    } else {
+        frame.render_widget(
+            Table::new(
+                rows,
+                [
+                    Constraint::Percentage(30),
+                    Constraint::Percentage(45),
+                    Constraint::Percentage(25),
+                ],
+            )
+            .header(header)
+            .block(block),
+            area,
+        );
+    }
+}
+
+pub(crate) fn zone_rate_cells(rate: BidirectionalRate) -> [Cell<'static>; 3] {
+    let cell = |value| {
+        Cell::from(Line::from(format_rate(value)).alignment(Alignment::Right))
+            .style(traffic_style(TrafficSeverity::for_bytes_per_sec(value)))
+    };
+    [
+        cell(rate.rx_bytes_sec),
+        cell(rate.tx_bytes_sec),
+        cell(rate.total_bytes_sec()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_support::{render, router, sled, switch, text};
+    use crate::tui::test_support::{rate, render, router, sled, switch, text};
     use crate::tui::{
+        app::TerminalSize,
         event::AppEvent,
         telemetry::{
-            HealthDiagnostic, NodeAddresses, NtpDiagnostic, ServiceState,
+            HealthDiagnostic, NtpDiagnostic, RackId, ServiceState,
+            TrafficSample, ZoneTraffic,
         },
     };
     use std::time::Instant;
@@ -375,16 +560,16 @@ mod tests {
         // (case, resource, [(when, event, health)], final summary)
         let cases = [
             (
-                "switch whose address probe stops answering",
+                "switch whose traffic probe stops answering",
                 switch_zone.clone(),
                 vec![
                     ("before any sample", tick(0), HealthState::Checking),
                     (
-                        "after an address sample",
-                        AppEvent::Addresses {
+                        "after a traffic sample",
+                        AppEvent::Traffic {
                             id: switch_zone.id.clone(),
                             at: at(0),
-                            addresses: NodeAddresses::default(),
+                            sample: TrafficSample::default(),
                         },
                         HealthState::Healthy,
                     ),
@@ -395,10 +580,10 @@ mod tests {
                     ),
                     (
                         "after the probe answers again",
-                        AppEvent::Addresses {
+                        AppEvent::Traffic {
                             id: switch_zone.id.clone(),
                             at: at(300),
-                            addresses: NodeAddresses::default(),
+                            sample: TrafficSample::default(),
                         },
                         HealthState::Healthy,
                     ),
@@ -437,7 +622,7 @@ mod tests {
 
         for (case, resource, steps, summary) in cases {
             let id = resource.id.clone();
-            let mut app = App::new(vec![resource], 4);
+            let mut app = App::new(vec![resource], 4, 4);
             app.deployment.observed = ObservedDeploymentState::Running;
             for (when, event, health) in steps {
                 app.update(event);
@@ -458,7 +643,7 @@ mod tests {
     }
 
     fn app_selecting(resource: ResourceDescriptor) -> App {
-        let mut app = App::new(vec![resource.clone()], 4);
+        let mut app = App::new(vec![resource.clone()], 4, 4);
         app.session.selected_resource = Some(resource.id);
         app
     }
@@ -504,7 +689,7 @@ mod tests {
         // and a success clears them.
         let id = router("ce").id;
         let mut app = app_selecting(router("ce"));
-        app.update(AppEvent::AddressesFailed {
+        app.update(AppEvent::TrafficFailed {
             id: id.clone(),
             at: now,
             message: "propolis uuid for ce: No such file".into(),
@@ -516,7 +701,7 @@ mod tests {
         assert!(!details.contains("propolis uuid"), "{details}");
 
         let after_reconciliation = now + Duration::from_secs(2);
-        app.update(AppEvent::AddressesFailed {
+        app.update(AppEvent::TrafficFailed {
             id: id.clone(),
             at: after_reconciliation,
             message: "router command failed after readiness".into(),
@@ -525,11 +710,58 @@ mod tests {
             &node_details_text(&app),
             &["router command failed after readiness"],
         );
-        app.update(AppEvent::Addresses {
+        app.update(AppEvent::Traffic {
             id: id.clone(),
             at: after_reconciliation + Duration::from_secs(1),
-            addresses: NodeAddresses::default(),
+            sample: TrafficSample::default(),
         });
         assert!(!resource_health_summary(&app, &id).contains("latest error"));
+    }
+
+    #[test]
+    fn operator_can_page_through_top_zones() {
+        // Sled g0 alone, with eight zones whose traffic falls with their
+        // index, so zone-0 tops the list.
+        let descriptor = sled(0, 0);
+        let mut app = App::new(vec![descriptor.clone()], 4, 4);
+        app.update(AppEvent::Traffic {
+            id: descriptor.id,
+            at: Instant::now(),
+            sample: TrafficSample {
+                zones: (0..8)
+                    .map(|index| ZoneTraffic {
+                        name: format!("zone-{index}"),
+                        short_name: format!("zone-{index}"),
+                        rate: rate((8 - index) as f64, 0.0),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        });
+
+        // The topology starts focused and takes most rows, but the rack
+        // summary keeps the rows its error banner needs.
+        assert_eq!(app.session.monitoring_pane, MonitoringPane::Topology);
+        let rows =
+            monitor_rows(Rect::new(0, 0, 160, 30), &app, LayoutMode::Wide);
+        assert_eq!(rows[0].height, 5);
+        assert!(rows[1].height > rows[2].height);
+
+        app.session.top_zones_scroll = 1;
+        let page = text(&render(100, 7, |frame| {
+            draw_top_zones(frame, frame.area(), &app, Some(RackId(0)))
+        }));
+        let visible = page
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace().find(|word| word.starts_with("zone-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["zone-1", "zone-2", "zone-3", "zone-4"], "{page}");
+        assert_shows(&page, &["Top Zones by Traffic 2-5 of 8"]);
+
+        // At this size Top Zones shows only its borders and header.
+        app.session.terminal = TerminalSize { width: 48, height: 16 };
+        assert_eq!(top_zones_page_capacity(&app), 0);
     }
 }

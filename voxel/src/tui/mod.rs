@@ -118,7 +118,11 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     ));
     let collector =
         Arc::new(collector::Collector::new(executor.clone(), &context.config));
-    let schedule = collector::SchedulerConfig::new(Duration::from_secs(10), 8)?;
+    let schedule = collector::SchedulerConfig::new(
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+        8,
+    )?;
     let context = Arc::new(context);
     let (events_tx, mut events_rx) = terminal::event_channel();
     let (effects_tx, effects_rx) = mpsc::unbounded_channel();
@@ -142,7 +146,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         durable.clone(),
     )
     .context("enter terminal UI")?;
-    let mut app = App::new(topology, 500);
+    let mut app = App::new(topology, 500, 120);
     app.durable_log_path = context.workdir.join("voxel-tui.log").to_string();
     if let Some((level, message)) = external_note {
         app.logs.push(app::LogEntry::application(level, message));
