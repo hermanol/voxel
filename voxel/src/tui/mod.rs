@@ -17,6 +17,7 @@ mod operation;
 mod phase;
 mod process;
 mod reconcile;
+mod session;
 mod terminal;
 #[cfg(test)]
 mod test_support;
@@ -32,6 +33,10 @@ pub(crate) use event::Action;
 pub(crate) use event::{AppEvent, Effect};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+pub(crate) fn resume(choose: bool) -> anyhow::Result<()> {
+    session::resume(choose)
+}
 
 fn prepare_probe_mounts(
     workdir: &camino::Utf8Path,
@@ -70,6 +75,8 @@ fn deployment_storage_present(context: &TuiContext) -> bool {
 }
 
 pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
+    let resumed_claim = session::claim_from_environment()?;
+
     // Everything that must survive terminal setup failure is created first.
     std::fs::create_dir_all(&context.workdir)?;
     let durable = logging::DurableLog::open(
@@ -77,7 +84,9 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     )
     .context("open durable TUI log")?;
     // A running deployment keeps the external mode it was launched with.
-    let external_note = if !deployment_storage_present(&context) {
+    let external_note = if resumed_claim.is_none()
+        && !deployment_storage_present(&context)
+    {
         context.default_isolated_external(crate::rack::default_route_iface())?
     } else {
         None
@@ -91,12 +100,18 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
             .write_line(&format!("{tag} {message}"))
             .context("write durable TUI log")?;
     }
+    let (mut detached, reattach) = session::prepare_direct(&context)?;
     prepare_probe_mounts(&context.workdir, &context.config)?;
     let mut topo = crate::topo::build_topo(&context.config, &context.name)?;
     topo.runner.log = durable.falcon_logger();
     let executor = Arc::new(collector::FalconExecutor::new(
         topo,
         &context.config,
+        resumed_claim
+            .as_ref()
+            .map(|claim| claim.addresses().clone())
+            .unwrap_or_default(),
+        resumed_claim.is_some(),
         Duration::from_secs(10),
     ));
     let context = Arc::new(context);
@@ -113,6 +128,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         .write(true)
         .open("/dev/tty")
         .context("open controlling terminal")?;
+    let clipboard_writer = terminal_writer.try_clone()?;
     let mut terminal = terminal::TerminalSession::enter(
         terminal_writer,
         shutdown.clone(),
@@ -124,6 +140,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     if let Some((level, message)) = external_note {
         app.logs.push(app::LogEntry::application(level, message));
     }
+    app.reattach_command = Some(reattach);
 
     let mut input = terminal::spawn_input(events_tx.clone(), shutdown.clone());
     let mut ticks = terminal::spawn_ticks(
@@ -196,8 +213,10 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     drop(events_tx);
 
     let mut renderer = ui::renderer::Renderer::new(Duration::from_millis(33));
+    let mut clipboard = std::io::BufWriter::new(clipboard_writer);
     let mut loop_future = Box::pin(ui::renderer::run_loop(
         terminal.terminal_mut(),
+        &mut clipboard,
         &mut renderer,
         &mut app,
         &mut events_rx,
@@ -309,7 +328,20 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!(error));
     }
     match app.session.exit {
-        Some(app::SessionExit::Quit) => Ok(()),
+        Some(app::SessionExit::Detach) => {
+            if resumed_claim.is_none() {
+                detached
+                    .set_addresses(executor_drain.resolved_addresses().await);
+                session::detach(&detached)?;
+            }
+            Ok(())
+        }
+        Some(app::SessionExit::Quit) => {
+            if let Some(claim) = resumed_claim {
+                claim.finish()?;
+            }
+            Ok(())
+        }
         None => Err(anyhow::anyhow!("TUI stopped without a confirmed exit")),
     }
 }

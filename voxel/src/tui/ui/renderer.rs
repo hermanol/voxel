@@ -9,7 +9,7 @@
 use crate::tui::{App, AppEvent, Effect};
 use ratatui::{Terminal, backend::Backend, layout::Rect};
 use std::{
-    io,
+    io::{self, Write},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -99,6 +99,7 @@ fn forward_effects(
 
 pub async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
+    clipboard: &mut impl Write,
     renderer: &mut Renderer,
     app: &mut App,
     events: &mut mpsc::Receiver<AppEvent>,
@@ -119,12 +120,24 @@ pub async fn run_loop<B: Backend>(
         };
         let pending_effects = app.update(event);
         let force_draw = !pending_effects.is_empty();
+        let mut forwarded = Vec::with_capacity(pending_effects.len());
+        for effect in pending_effects {
+            match effect {
+                Effect::CopyToClipboard(command) => {
+                    crate::tui::terminal::write_osc52(
+                        &mut *clipboard,
+                        &command,
+                    )?;
+                }
+                effect => forwarded.push(effect),
+            }
+        }
         if let Err(error) = renderer.draw(terminal, app, force_draw) {
             return Ok(LoopExit::RenderFailed { message: error.to_string() });
         }
         let confirmed_exit =
-            pending_effects.iter().any(|effect| matches!(effect, Effect::Quit));
-        if let Err(unsent) = forward_effects(effects, pending_effects) {
+            forwarded.iter().any(|effect| matches!(effect, Effect::Quit));
+        if let Err(unsent) = forward_effects(effects, forwarded) {
             return Ok(LoopExit::EffectChannelClosed { unsent });
         }
         if confirmed_exit {
@@ -164,6 +177,7 @@ mod tests {
 
         let exit = run_loop(
             &mut terminal,
+            &mut Vec::new(),
             &mut Renderer::new(Duration::ZERO),
             &mut app,
             &mut rx,

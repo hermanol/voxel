@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Terminal plumbing: the raw-mode and alternate-screen lifecycle on
-//! `/dev/tty`, key mapping, and the input and tick tasks.
+//! `/dev/tty`, key mapping, the input and tick tasks, and OSC 52 clipboard
+//! writes.
 
 use std::{
     io::{self, Write},
@@ -12,6 +13,8 @@ use std::{
     thread,
     time::Duration,
 };
+
+use base64::Engine;
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -64,13 +67,25 @@ pub fn key_action(key: KeyEvent) -> Option<Action> {
         KeyCode::PageDown => Action::Scroll { delta: 1, page: true },
         KeyCode::Char('f') => Action::CycleLogFilter,
         KeyCode::Esc => Action::Close,
+        KeyCode::Char('y') => Action::CopyReattachCommand,
         KeyCode::Char('n') => Action::Reject,
         KeyCode::Char('l') => Action::RequestLaunch,
         KeyCode::Char('r') => Action::RequestRoute,
+        KeyCode::Char('d') => Action::RequestDetach,
         KeyCode::Char('q') => Action::RequestQuit,
         KeyCode::Char('x') => Action::RequestCancelAndDestroy,
         _ => return None,
     })
+}
+
+pub fn osc52(text: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\u{1b}]52;c;{encoded}\u{7}")
+}
+
+pub fn write_osc52(mut writer: impl io::Write, text: &str) -> io::Result<()> {
+    writer.write_all(osc52(text).as_bytes())?;
+    writer.flush()
 }
 
 fn handoff(
@@ -406,8 +421,10 @@ mod tests {
             (KeyCode::Esc, Some(Action::Close)),
             (KeyCode::Char('l'), Some(Action::RequestLaunch)),
             (KeyCode::Char('r'), Some(Action::RequestRoute)),
+            (KeyCode::Char('d'), Some(Action::RequestDetach)),
             (KeyCode::Char('q'), Some(Action::RequestQuit)),
             (KeyCode::Char('x'), Some(Action::RequestCancelAndDestroy)),
+            (KeyCode::Char('y'), Some(Action::CopyReattachCommand)),
             (KeyCode::Char('n'), Some(Action::Reject)),
             (KeyCode::Up, Some(Action::Scroll { delta: -1, page: false })),
             (KeyCode::Down, Some(Action::Scroll { delta: 1, page: false })),
@@ -427,6 +444,14 @@ mod tests {
             }),
             None,
             "release of q"
+        );
+    }
+
+    #[test]
+    fn osc52_encodes_exact_text_without_a_newline() {
+        assert_eq!(
+            osc52("voxel tui resume"),
+            "\u{1b}]52;c;dm94ZWwgdHVpIHJlc3VtZQ==\u{7}"
         );
     }
 

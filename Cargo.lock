@@ -6123,6 +6123,7 @@ version = "0.9.0"
 dependencies = [
  "anyhow",
  "attest-mock",
+ "base64 0.22.1",
  "camino",
  "clap",
  "crossterm",
@@ -6138,6 +6139,7 @@ dependencies = [
  "rack-init-config",
  "ratatui",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "sled-agent-types",

@@ -40,6 +40,7 @@ pub enum Direction {
 pub enum Confirmation {
     Launch,
     Route,
+    Detach,
     Quit,
     QuitAndDestroy,
     CancelAndDestroy,
@@ -66,6 +67,10 @@ const LAUNCH_OPTIONS: &[ConfirmationOption] = &[
 const ROUTE_OPTIONS: &[ConfirmationOption] = &[
     ConfirmationOption { label: "Apply routes", action: Confirm },
     ConfirmationOption { label: "Cancel", action: Reject },
+];
+const DETACH_OPTIONS: &[ConfirmationOption] = &[
+    ConfirmationOption { label: "Leave and keep it running", action: Confirm },
+    ConfirmationOption { label: "Back", action: Reject },
 ];
 const QUIT_OPTIONS: &[ConfirmationOption] = &[
     ConfirmationOption { label: "Quit Voxel TUI", action: Confirm },
@@ -94,6 +99,7 @@ impl Confirmation {
         match self {
             Self::Launch => LAUNCH_OPTIONS,
             Self::Route => ROUTE_OPTIONS,
+            Self::Detach => DETACH_OPTIONS,
             Self::Quit => QUIT_OPTIONS,
             Self::QuitAndDestroy => QUIT_AND_DESTROY_OPTIONS,
             Self::CancelAndDestroy => DESTROY_CANCEL_OPTIONS,
@@ -104,6 +110,7 @@ impl Confirmation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancelChoice {
+    Leave,
     Destroy,
 }
 
@@ -123,6 +130,7 @@ pub enum Effect {
     Start { request_id: OperationRequestId, kind: OperationKind },
     Cancel { request_id: OperationRequestId, choice: CancelChoice },
     ForceStop { request_id: OperationRequestId },
+    CopyToClipboard(String),
     Quit,
 }
 
@@ -136,8 +144,10 @@ pub enum Action {
     Close,
     RequestLaunch,
     RequestRoute,
+    RequestDetach,
     RequestQuit,
     RequestCancelAndDestroy,
+    CopyReattachCommand,
     Reject,
     CycleLogFilter,
     Scroll { delta: isize, page: bool },

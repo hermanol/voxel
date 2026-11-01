@@ -20,7 +20,10 @@ The TUI is the `voxel` crate's opt-in `tui` feature; a build without it has no
 `voxel tui` subcommand.
 
 Logs are written to `<resolved workdir>/voxel-tui.log` and displayed in a
-bounded on-screen history. The TUI can launch and destroy Voxel deployments.
+bounded on-screen history. The TUI can launch and destroy Voxel deployments,
+and its session can attach to or detach from new or existing deployments. Use
+`voxel tui resume` to resume the most recent detached session, or add `--choose`
+to select one.
 
 ### External network
 
@@ -35,8 +38,8 @@ to the rack cannot be installed, and Nexus and its Oximeter telemetry are
 unreachable. The isolated segment puts `ce` on a host-attached subnet, so the
 route always installs.
 
-An explicit `external.mode`, including `"lan"`, is left alone, and a running
-deployment keeps the mode it was launched with. To keep LAN behavior:
+An explicit `external.mode`, including `"lan"`, is left alone, and a running or
+resumed deployment keeps the mode it was launched with. To keep LAN behavior:
 
 ```console
 $ voxel config set external.mode lan
@@ -60,6 +63,8 @@ focus, and `Space` folds or expands the focused section.
 | `f` | Cycle the level filter while Deployment Logs is focused |
 | `l` / `r` | Request launch / route |
 | `x` | Stop the operation and destroy the deployment; press again to force stop a command that will not settle |
+| `d` | Leave the TUI, keeping the deployment running; resume with `voxel tui resume` |
+| `y` | Copy the full fallback command from the detach dialog |
 | `n` | Reject a confirmation |
 | `q` | Quit and destroy the deployment, unless it is already observed stopped |
 

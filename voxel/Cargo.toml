@@ -13,13 +13,14 @@ path = "src/main.rs"
 [features]
 # `voxel tui`. Building without it leaves the CLI and drops the terminal UI's
 # dependencies.
-tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm"]
+tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64"]
 
 [dependencies]
 tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 libfalcon.workspace = true
 propolis-client.workspace = true
 anyhow.workspace = true
@@ -40,6 +41,7 @@ sled-agent-types.workspace = true
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
 serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
 # Unpack TUF control-plane composites (GNU tar format; illumos tar rejects it).
 tar = "0.4"
 flate2 = "1"

@@ -67,6 +67,10 @@ pub(crate) struct TuiContext {
 }
 
 impl TuiContext {
+    pub(crate) fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config_path: Utf8PathBuf,
