@@ -86,17 +86,21 @@ Error. The complete history remains in the durable log file.
 ### Monitoring
 
 The Monitoring view exposes the state of a Voxel deployment, and contains
-**Rack Summary** and **Topology** in separate sections.
-Rack Summary reports RSS readiness and health counts.
+**Rack Summary**, **Topology**, and **Top Zones by Traffic** in separate
+sections.
+Rack Summary reports RSS readiness, aggregate RX/TX, health counts, and history.
 Topology presents fleet routers, the shared switch-fabric bus, rack-local switch
 zones, and sleds in the order of router → switch zone → sled.
 
 The resource inspector sits beside the topology on wide layouts and below it on
 compact layouts. Health summarizes sled-agent, maintenance services, zones, and
-NTP probes for sleds, and address probes for routers and switch zones. The
-inspector also shows the last successful probe, latest collection error, and
-addresses. A node with no successful sample says so rather than reporting
-healthy.
+NTP probes for sleds, and traffic collection for routers and switch zones. The
+inspector also shows the last successful probe, latest collection error,
+RX/TX/total and packet rates, a 60-second sparkline, and zones. Missing samples
+say collecting or unavailable rather than reporting zero. For the purposes of
+a basic labelled implementation, traffic is considered normal at or below 100
+KB/s, elevated above 100 KB/s through 5 MB/s, and high above 5 MB/s. **Top Zones
+by Traffic** is a separate rack-wide ranking.
 
 ### Display
 

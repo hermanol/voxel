@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn status_names_the_operation_and_every_failure() {
         let app = |setup: &dyn Fn(&mut App)| {
-            let mut app = App::new(vec![], 8);
+            let mut app = App::new(vec![], 8, 8);
             setup(&mut app);
             app
         };

@@ -3,8 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Periodic telemetry collection. Probes sleds and routers over Falcon
-//! serial and SSH for addresses, service health and RSS progress, and
-//! publishes the samples as [`AppEvent`]s on a bounded schedule.
+//! serial and SSH for link counters, addresses, service health and RSS
+//! progress, and publishes the samples as [`AppEvent`]s on a bounded
+//! schedule.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
@@ -21,12 +22,18 @@ use voxel_config::VoxelConfig;
 use crate::tui::event::AppEvent;
 use crate::tui::reconcile::{parse_rss_observation, rss_probe_command};
 use crate::tui::telemetry::{
-    HealthDiagnostic, RackId, ResourceId, ResourceKind, parse_chrony_tracking,
-    parse_failed_services, parse_ipadm_addresses, parse_linux_ip_addresses,
-    parse_service_state, parse_zone_diagnostics, resource_descriptors,
+    CounterSnapshot, HealthDiagnostic, RackId, ResourceId, ResourceKind,
+    ResourceTelemetry, TrafficSample, parse_chrony_tracking,
+    parse_dladm_zone_vnics, parse_failed_services, parse_ipadm_addresses,
+    parse_kstat_link_counters, parse_linux_ip_addresses,
+    parse_linux_link_counters, parse_service_state, parse_zone_diagnostics,
+    resource_descriptors,
 };
 
+const KSTAT: &str = "kstat -p -c net link:::rbytes64 link:::obytes64 link:::ipackets64 link:::opackets64";
+const DLADM: &str = "dladm show-linkprop -c -p zone -o link,value";
 const IPADM: &str = "ipadm show-addr -p -o addrobj,addr";
+const LINUX_COUNTERS: &str = "for n in /sys/class/net/*; do i=${n##*/}; echo $i $(cat $n/statistics/rx_bytes) $(cat $n/statistics/tx_bytes) $(cat $n/statistics/rx_packets) $(cat $n/statistics/tx_packets); done";
 const LINUX_ADDRESSES: &str = "ip -o addr show";
 const SLED_AGENT_STATE: &str = "svcs -H -o state svc:/oxide/sled-agent:default";
 const MAINTENANCE_SERVICES: &str =
@@ -373,32 +380,42 @@ impl CollectorTargets {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerConfig {
+    pub traffic_interval: Duration,
     pub health_interval: Duration,
     pub concurrency: usize,
 }
 
 impl SchedulerConfig {
     pub fn new(
+        traffic_interval: Duration,
         health_interval: Duration,
         concurrency: usize,
     ) -> anyhow::Result<Self> {
-        if health_interval.is_zero() || concurrency == 0 {
+        if traffic_interval.is_zero()
+            || health_interval.is_zero()
+            || concurrency == 0
+        {
             return Err(anyhow!(
                 "collector intervals and concurrency must be nonzero"
             ));
         }
-        Ok(Self { health_interval, concurrency })
+        Ok(Self { traffic_interval, health_interval, concurrency })
     }
 }
 
 pub struct Collector<E> {
     executor: Arc<E>,
     targets: CollectorTargets,
+    baselines: Arc<Mutex<BTreeMap<ResourceId, ResourceTelemetry>>>,
 }
 
 impl<E: NodeExecutor> Collector<E> {
     pub fn new(executor: Arc<E>, config: &VoxelConfig) -> Self {
-        Self { executor, targets: CollectorTargets::from_config(config) }
+        Self {
+            executor,
+            targets: CollectorTargets::from_config(config),
+            baselines: Default::default(),
+        }
     }
 
     async fn call(
@@ -437,6 +454,74 @@ impl<E: NodeExecutor> Collector<E> {
             _ = cancel.cancelled() => false,
             result = sender.send(event) => result.is_ok(),
         }
+    }
+
+    async fn collect_traffic_with_limit(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        cancel: &CancellationToken,
+        concurrency: usize,
+    ) -> bool {
+        let at = Instant::now();
+        let jobs = self.targets.resources.clone().into_iter().map(
+            |resource| async move {
+                let result = self.traffic_one(&resource, at, cancel).await;
+                (resource.id, result)
+            },
+        );
+        // Finish all command futures before awaiting bounded event sends. This
+        // prevents send cancellation/closure from dropping an in-flight Falcon
+        // serial future held by the unordered job stream.
+        let results = stream::iter(jobs)
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        for event in results.into_iter().map(|(id, result)| match result {
+            Ok(sample) => AppEvent::Traffic { id, at, sample },
+            Err(error) => {
+                AppEvent::TrafficFailed { id, at, message: error.to_string() }
+            }
+        }) {
+            if !Self::send(sender, cancel, event).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn traffic_one(
+        &self,
+        resource: &ResourceTarget,
+        at: Instant,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<TrafficSample> {
+        let counters = match resource.kind {
+            ResourceKind::Router => parse_linux_link_counters(
+                &self.call(cancel, &resource.target, LINUX_COUNTERS).await?,
+            ),
+            _ => parse_kstat_link_counters(
+                &self.call(cancel, &resource.target, KSTAT).await?,
+            ),
+        };
+        if counters.is_empty() {
+            return Err(anyhow!("counter output contained no complete links"));
+        }
+        let zones = if resource.kind == ResourceKind::Sled {
+            parse_dladm_zone_vnics(
+                &self.call(cancel, &resource.target, DLADM).await?,
+            )
+        } else {
+            vec![]
+        };
+        let mut baselines = self.baselines.lock().await;
+        let state = baselines.entry(resource.id.clone()).or_default();
+        state.zones = zones;
+        state.update(CounterSnapshot::new(at, counters));
+        Ok(TrafficSample {
+            total: state.total_rate(),
+            links: state.link_rates.clone(),
+            zones: state.top_zones(usize::MAX),
+        })
     }
 
     async fn collect_health_with_limit(
@@ -600,11 +685,14 @@ impl<E: NodeExecutor> Collector<E> {
         cancel: CancellationToken,
         gate: Arc<tokio::sync::Semaphore>,
     ) {
-        let mut health_due = tokio::time::Instant::now();
+        let now = tokio::time::Instant::now();
+        let mut traffic_due = now;
+        let mut health_due = now;
         loop {
+            let next_due = traffic_due.min(health_due);
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep_until(health_due) => {},
+                _ = tokio::time::sleep_until(next_due) => {},
             }
             let permit = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -613,10 +701,28 @@ impl<E: NodeExecutor> Collector<E> {
                     Err(_) => break,
                 },
             };
-            let keep_running = self
-                .collect_health_with_limit(&sender, &cancel, config.concurrency)
-                .await;
-            health_due = tokio::time::Instant::now() + config.health_interval;
+            let health_cadence = health_due < traffic_due;
+            let keep_running = if health_cadence {
+                self.collect_health_with_limit(
+                    &sender,
+                    &cancel,
+                    config.concurrency,
+                )
+                .await
+            } else {
+                self.collect_traffic_with_limit(
+                    &sender,
+                    &cancel,
+                    config.concurrency,
+                )
+                .await
+            };
+            let completed = tokio::time::Instant::now();
+            if health_cadence {
+                health_due = completed + config.health_interval;
+            } else {
+                traffic_due = completed + config.traffic_interval;
+            }
             drop(permit);
             if !keep_running {
                 break;
@@ -630,10 +736,11 @@ mod tests {
     use super::*;
     use crate::tui::app::App;
     use crate::tui::reconcile::ObservedDeploymentState;
-    use crate::tui::telemetry::HealthState;
+    use crate::tui::telemetry::{BidirectionalRate, HealthState};
     use crate::tui::test_support::config;
     use crate::tui::ui::monitor::resource_health_state;
     use indoc::indoc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// How long a step may take before it counts as hung. Only a failing
     /// test waits this long.
@@ -644,9 +751,16 @@ mod tests {
         "zlogin oxz_ntp_deadbeef chronyc -n tracking 2>/dev/null";
     const RSS_PROBE: &str = "curl -s --max-time 5 ";
 
-    /// What a healthy node answers.
-    fn response(command: &str) -> String {
+    /// What a healthy node answers; every counter reads `counter`.
+    fn response(counter: u64, command: &str) -> String {
         match command {
+            KSTAT => format!(
+                "0:link:net0:rbytes64\t{counter}\n0:link:net0:obytes64\t{counter}\n0:link:net0:ipackets64\t{counter}\n0:link:net0:opackets64\t{counter}\n"
+            ),
+            DLADM => "net0:oxz_nexus_deadbeef0\n".into(),
+            LINUX_COUNTERS => {
+                format!("eth0 {counter} {counter} {counter} {counter}\n")
+            }
             SLED_AGENT_STATE => "online\n".into(),
             ZONEADM => "global\noxz_ntp_deadbeef\n".into(),
             NTP_TRACKING => "Stratum : 3\nLeap status : Normal\n".into(),
@@ -663,6 +777,7 @@ mod tests {
     enum Reply {
         Output(&'static str),
         Fail(&'static str),
+        Delay(Duration),
         /// Wait until `FakeExecutor::release` is cancelled.
         Held,
     }
@@ -675,6 +790,7 @@ mod tests {
     #[derive(Default)]
     struct FakeExecutor {
         rules: Vec<Rule>,
+        generation: AtomicU64,
         commands: std::sync::Mutex<Vec<String>>,
         release: CancellationToken,
     }
@@ -712,10 +828,13 @@ mod tests {
                 match reply {
                     Some(Reply::Output(output)) => return Ok(output.into()),
                     Some(Reply::Fail(message)) => return Err(anyhow!(message)),
+                    Some(Reply::Delay(delay)) => {
+                        tokio::time::sleep(delay).await
+                    }
                     Some(Reply::Held) => self.release.cancelled().await,
                     None => {}
                 }
-                Ok(response(command))
+                Ok(response(self.generation.load(Ordering::SeqCst), command))
             })
         }
     }
@@ -738,13 +857,16 @@ mod tests {
         Collector {
             executor,
             targets: CollectorTargets { resources, rss: vec![] },
+            baselines: Default::default(),
         }
     }
 
     /// The fleet's resources become typed probe targets with the right
-    /// address source.
-    #[test]
-    fn every_node_is_probed_at_its_address() {
+    /// address source. A first traffic round reports every resource at the
+    /// round's timestamp; the next turns counter deltas into rates over the
+    /// elapsed time. A router whose counters come back empty fails alone.
+    #[tokio::test]
+    async fn traffic_round_reports_rates_for_every_resource() {
         let fleet = config(indoc! {r#"
             [topology]
             racks = 2
@@ -849,12 +971,105 @@ mod tests {
                 .map_err(|error| error.to_string());
             assert_eq!((cache.resolved, probe), (holds, g0), "{case}");
         }
+
+        let fake = fake(vec![(Some("cr1"), LINUX_COUNTERS, Reply::Output(""))]);
+        let collector = Collector::new(fake.clone(), &fleet);
+        let cr1 = ResourceId::fleet(ResourceKind::Router, "cr1");
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        assert!(
+            collector.collect_traffic_with_limit(&sender, &cancel, 4).await
+        );
+        let mut round1: Vec<_> =
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(|event| match event {
+                    AppEvent::Traffic { id, at, sample } => {
+                        (id, at, Some(sample.total.total_bytes_sec()))
+                    }
+                    AppEvent::TrafficFailed { id, at, .. } => (id, at, None),
+                    other => panic!("unexpected event {other:?}"),
+                })
+                .collect();
+        assert!(
+            round1.iter().all(|(_, at, _)| *at == round1[0].1),
+            "round 1 events do not share the round's timestamp"
+        );
+        round1.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<_> = targets
+            .resources
+            .iter()
+            .map(|resource| {
+                let id = resource.id.clone();
+                // Without a baseline there is no rate yet.
+                let rate = (id != cr1).then_some(0.0);
+                (id, rate)
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            round1
+                .into_iter()
+                .map(|(id, _, rate)| (id, rate))
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        // Round 2 comes twenty seconds after round 1, with every counter
+        // 1,000 higher; so long an interval keeps the rate whole however
+        // slowly the round runs.
+        for state in collector.baselines.lock().await.values_mut() {
+            state.baseline.as_mut().unwrap().captured_at -=
+                Duration::from_secs(20);
+        }
+        fake.generation.store(1_000, Ordering::SeqCst);
+        assert!(
+            collector.collect_traffic_with_limit(&sender, &cancel, 4).await
+        );
+        let whole = |rate: BidirectionalRate| rate.total_bytes_sec().round();
+        let round2: BTreeMap<_, _> =
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .filter_map(|event| match event {
+                    AppEvent::Traffic { id, sample, .. } => Some((
+                        id,
+                        (
+                            whole(sample.total),
+                            sample.links.into_keys().collect::<Vec<_>>(),
+                            sample
+                                .zones
+                                .into_iter()
+                                .map(|zone| (zone.name, whole(zone.rate)))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        // 50 bytes a second each way, with a sled's VNIC traffic
+        // attributed to its zone.
+        let expected = targets
+            .resources
+            .iter()
+            .filter(|resource| resource.id != cr1)
+            .map(|resource| {
+                let (links, zones) = match resource.kind {
+                    ResourceKind::Sled => (
+                        vec!["net0".to_owned()],
+                        vec![("oxz_nexus_deadbeef0".to_owned(), 100.0)],
+                    ),
+                    ResourceKind::SwitchZone => (vec!["net0".into()], vec![]),
+                    ResourceKind::Router => (vec!["eth0".into()], vec![]),
+                };
+                (resource.id.clone(), (100.0, links, zones))
+            })
+            .collect();
+        assert_eq!(round2, expected);
     }
 
-    /// After a health round, every resource and rack has been observed and
-    /// the monitor shows it: rack 0 is healthy, while rack 1 has a service in
-    /// maintenance and an unreachable RSS sled, neither of which hides rack
-    /// 0's observations.
+    /// After a traffic round and a health round, every resource and rack has
+    /// been observed and the monitor shows it: rack 0 is healthy, while rack
+    /// 1 has a service in maintenance and an unreachable RSS sled, neither of
+    /// which hides rack 0's observations.
     #[tokio::test]
     async fn health_round_reaches_the_operator_for_every_resource_and_rack() {
         let config = config(indoc! {r#"
@@ -873,6 +1088,9 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
+        assert!(
+            collector.collect_traffic_with_limit(&sender, &cancel, 2).await
+        );
         assert!(collector.collect_health_with_limit(&sender, &cancel, 2).await);
         let events: Vec<_> =
             std::iter::from_fn(|| receiver.try_recv().ok()).collect();
@@ -909,7 +1127,7 @@ mod tests {
             "RSS failures by rack"
         );
 
-        let mut app = App::new(resources.clone(), 8);
+        let mut app = App::new(resources.clone(), 8, 8);
         app.deployment.observed = ObservedDeploymentState::Running;
         for event in events {
             app.update(event);
@@ -959,17 +1177,17 @@ mod tests {
         // event channel starts full)
         let rows = [
             ("sending into a full event channel", vec![sled()], None, true),
-            ("in-flight SSH probe", vec![sled()], Some(IPADM), false),
+            ("in-flight SSH probe", vec![sled()], Some(KSTAT), false),
             (
                 "in-flight router call",
                 vec![router()],
-                Some(LINUX_ADDRESSES),
+                Some(LINUX_COUNTERS),
                 false,
             ),
             (
                 "in-flight router call with a full event channel",
                 vec![sled(), router()],
-                Some(LINUX_ADDRESSES),
+                Some(LINUX_COUNTERS),
                 true,
             ),
         ];
@@ -993,20 +1211,20 @@ mod tests {
                 let cancel = cancel.clone();
                 async move {
                     collector
-                        .collect_health_with_limit(&sender, &cancel, limit)
+                        .collect_traffic_with_limit(&sender, &cancel, limit)
                         .await
                 }
             });
             // Unheld, the round blocks sending the sample its last command
             // produced.
-            let blocked_on = held.unwrap_or(NTP_TRACKING);
+            let blocked_on = held.unwrap_or(DLADM);
             wait_until(case, || {
                 fake.commands().iter().any(|c| c == blocked_on)
             })
             .await;
 
             cancel.cancel();
-            if held == Some(LINUX_ADDRESSES) {
+            if held == Some(LINUX_COUNTERS) {
                 tokio::task::yield_now().await;
                 assert!(
                     !task.is_finished(),
@@ -1030,49 +1248,89 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let cancel = CancellationToken::new();
-        let round = collector.collect_health_with_limit(&sender, &cancel, 1);
+        let round = collector.collect_traffic_with_limit(&sender, &cancel, 1);
         assert!(
             matches!(tokio::time::timeout(HANG, round).await, Ok(false)),
             "UI closed: the round did not stop"
         );
     }
 
-    /// The scheduler keeps its concurrency limit and stops when cancelled.
+    /// The scheduler keeps its concurrency limit and never runs the traffic
+    /// and health cadences at once, yet slow probes hold up neither cadence.
     #[tokio::test]
-    async fn scheduler_keeps_its_limit_and_stops_when_cancelled() {
+    async fn slow_probes_do_not_block_either_cadence() {
         let config = config(indoc! {r#"
             [topology]
             racks = 2
             sleds = 2
             routers = ["ce"]
         "#});
+        let gate = || Arc::new(tokio::sync::Semaphore::new(1));
+
         let held = fake(vec![
-            (None, IPADM, Reply::Held),
-            (None, LINUX_ADDRESSES, Reply::Held),
+            (None, KSTAT, Reply::Held),
+            (None, LINUX_COUNTERS, Reply::Held),
         ]);
         let collector = Arc::new(Collector::new(held.clone(), &config));
         let hour = Duration::from_secs(3_600);
         let (sender, _receiver) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(collector.run_gated(
-            SchedulerConfig::new(hour, 2).unwrap(),
+        tokio::spawn(collector.run_gated(
+            SchedulerConfig::new(hour, hour, 2).unwrap(),
             sender,
             cancel.clone(),
-            Arc::new(tokio::sync::Semaphore::new(1)),
+            gate(),
         ));
-        wait_until("two health probes running", || held.commands().len() >= 2)
+        wait_until("two traffic probes running", || held.commands().len() >= 2)
             .await;
         let commands = held.commands();
         assert!(
             commands.len() == 2
-                && commands
-                    .iter()
-                    .all(|c| *c == IPADM || *c == LINUX_ADDRESSES),
-            "probes beyond the limit: {commands:?}"
+                && commands.iter().all(|c| *c == KSTAT || *c == LINUX_COUNTERS),
+            "probes beyond the limit, or health during traffic: {commands:?}"
         );
-        // A held router call finishes before the round observes cancellation.
         cancel.cancel();
-        held.release.cancel();
+
+        // Traffic probes outlast the traffic interval, so traffic is always
+        // due.
+        let slow = Reply::Delay(Duration::from_millis(20));
+        let collector = Arc::new(Collector::new(
+            fake(vec![(None, KSTAT, slow), (None, LINUX_COUNTERS, slow)]),
+            &config,
+        ));
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(
+            collector.run_gated(
+                SchedulerConfig::new(
+                    Duration::from_millis(5),
+                    Duration::from_millis(15),
+                    2,
+                )
+                .unwrap(),
+                sender,
+                cancel.clone(),
+                gate(),
+            ),
+        );
+        let mut traffic_rounds = BTreeSet::new();
+        let mut health_round = false;
+        let _ = tokio::time::timeout(HANG, async {
+            while traffic_rounds.len() < 3 || !health_round {
+                match receiver.recv().await {
+                    Some(AppEvent::Traffic { at, .. }) => {
+                        traffic_rounds.insert(at);
+                    }
+                    Some(AppEvent::Rss { .. }) => health_round = true,
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        assert!(traffic_rounds.len() >= 3, "direct traffic lost its cadence");
+        assert!(health_round, "health starved while traffic is always due");
+        cancel.cancel();
         assert!(
             tokio::time::timeout(HANG, task).await.is_ok_and(|r| r.is_ok()),
             "the scheduler did not stop when cancelled"

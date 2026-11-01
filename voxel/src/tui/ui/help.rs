@@ -36,6 +36,7 @@ const DEPLOYMENT: &[(&str, &str)] = &[
 const MONITORING: &[(&str, &str)] = &[
     ("← / →", "Previous / next rack; sibling node in the rack"),
     ("↑ / ↓", "Move within section"),
+    ("PgUp / PgDn", "Page top zones"),
     ("Enter / Esc", "Focus node details / back to the rack"),
 ];
 const DIALOGS: &[(&str, &str)] = &[

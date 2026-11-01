@@ -2,22 +2,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The Rack Summary section: the selected rack's RSS state and health at a
-//! glance.
+//! The Rack Summary section: the selected rack's RSS state, traffic rates
+//! and health at a glance.
 
 use super::{
-    monitor::resource_health_state,
-    widgets::{section_block, selection_style},
+    monitor::{resource_health_state, sparkline_data},
+    widgets::{format_rate, section_block, selection_style, traffic_style},
 };
 use crate::{
     tui::reconcile::ObservedDeploymentState,
     tui::reconcile::RssObservation,
     tui::{
         App,
-        telemetry::{Freshness, HealthState, LatestSample},
+        telemetry::{Freshness, HealthState, LatestSample, TrafficSeverity},
     },
 };
-use ratatui::{layout::Rect, text::Line, widgets::Paragraph};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
+    text::Line,
+    widgets::{Paragraph, Sparkline},
+};
 use std::{collections::BTreeSet, time::Duration};
 
 pub fn draw(
@@ -48,12 +53,21 @@ pub fn draw(
         .unwrap_or(0);
     let Some(rack) = racks.get(selected_index).copied() else {
         frame.render_widget(
-            Paragraph::new("No racks configured · RSS unavailable")
-                .block(block),
+            Paragraph::new(
+                "No racks configured · RSS unavailable · no traffic samples",
+            )
+            .block(block),
             area,
         );
         return;
     };
+    let rate = app
+        .observability
+        .telemetry
+        .rack_rates
+        .get(&rack)
+        .copied()
+        .unwrap_or_default();
     let (healthy, unhealthy, checking) = app
         .deployment
         .topology
@@ -83,20 +97,88 @@ pub fn draw(
         ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let health = if compact {
-        format!("{healthy}/{unhealthy}/{checking}")
-    } else {
-        format!("health {healthy} ok / {unhealthy} bad / {checking} checking")
-    };
-    frame.render_widget(
-        Paragraph::new(health),
-        Rect::new(
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
+        .split(Rect::new(
             inner.x,
             inner.y.saturating_add(1),
             inner.width,
-            inner.height.saturating_sub(1).min(1),
-        ),
-    );
+            inner.height.saturating_sub(1),
+        ));
+    let rate_text = if compact {
+        format!(
+            "RX {} TX {} Σ{} · {healthy}/{unhealthy}/{checking}",
+            format_rate(rate.rx_bytes_sec),
+            format_rate(rate.tx_bytes_sec),
+            format_rate(rate.total_bytes_sec())
+        )
+    } else {
+        format!(
+            "RX {} · TX {} · Total {} · health {healthy} ok / {unhealthy} bad / {checking} checking",
+            format_rate(rate.rx_bytes_sec),
+            format_rate(rate.tx_bytes_sec),
+            format_rate(rate.total_bytes_sec())
+        )
+    };
+    let history_area = if rows[1].height > 0 {
+        frame.render_widget(
+            Paragraph::new(rate_text).style(traffic_style(
+                TrafficSeverity::for_bytes_per_sec(rate.total_bytes_sec()),
+            )),
+            rows[0],
+        );
+        rows[1]
+    } else {
+        let columns = Layout::horizontal([
+            Constraint::Percentage(68),
+            Constraint::Percentage(32),
+        ])
+        .split(rows[0]);
+        frame.render_widget(
+            Paragraph::new(rate_text).style(traffic_style(
+                TrafficSeverity::for_bytes_per_sec(rate.total_bytes_sec()),
+            )),
+            columns[0],
+        );
+        columns[1]
+    };
+    if history_area.height > 0 {
+        let data = app
+            .observability
+            .telemetry
+            .rack_histories
+            .get(&rack)
+            .map(|history| {
+                sparkline_data(
+                    history
+                        .points()
+                        .iter()
+                        .map(|point| point.rate.total_bytes_sec()),
+                    history_area.width,
+                )
+            })
+            .unwrap_or_default();
+        if data.is_empty() {
+            frame.render_widget(
+                Paragraph::new("Rack traffic (this TUI session): collecting"),
+                history_area,
+            );
+        } else {
+            let label = "Rack traffic (this TUI session) ";
+            let label_width = label.len().min(history_area.width.into()) as u16;
+            frame.render_widget(Paragraph::new(label), history_area);
+            frame.render_widget(
+                Sparkline::default()
+                    .data(&data)
+                    .style(Style::default().fg(Color::Cyan)),
+                Rect::new(
+                    history_area.x.saturating_add(label_width),
+                    history_area.y,
+                    history_area.width.saturating_sub(label_width),
+                    history_area.height,
+                ),
+            );
+        }
+    }
 }
 
 fn rss_summary(app: &App, sample: &LatestSample<RssObservation>) -> String {

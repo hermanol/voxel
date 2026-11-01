@@ -9,14 +9,18 @@ use super::{
     colors::{OX_GREEN_LIGHT, OX_OFF_WHITE, OX_RED, OX_YELLOW, TUI_GREY},
     monitor::{
         collection_error_is_visible, detail_area, health_status_label,
-        health_style, resource_health_state, resource_health_summary,
+        health_style, rate_line, resource_health_state,
+        resource_health_summary, sparkline_data, visible_traffic_error,
     },
     topology::health_glyph,
-    widgets::{help_function_style, help_key_style, line_style, rounded_block},
+    widgets::{
+        format_rate, help_function_style, help_key_style, line_style,
+        rounded_block, terminal_width,
+    },
 };
 use crate::tui::{
     App,
-    telemetry::{ResourceDescriptor, ResourceKind},
+    telemetry::{ResourceDescriptor, ResourceKind, TrafficSeverity},
 };
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -77,7 +81,7 @@ pub(crate) fn scroll_limits(app: &App) -> (usize, usize) {
     };
     let layout = detail_layout(area);
     let inner = content_block(&layout, true).inner(layout.content);
-    let lines = Paragraph::new(detail_text(app, descriptor))
+    let lines = Paragraph::new(detail_text(app, descriptor, inner.width))
         .wrap(Wrap { trim: false })
         .line_count(inner.width);
     let viewport = usize::from(inner.height);
@@ -108,8 +112,8 @@ pub(crate) fn draw(
     let block = content_block(&layout, focused);
     let inner = block.inner(layout.content);
     frame.render_widget(block, layout.content);
-    let paragraph =
-        Paragraph::new(detail_text(app, descriptor)).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(detail_text(app, descriptor, inner.width))
+        .wrap(Wrap { trim: false });
     let limit = paragraph
         .line_count(inner.width)
         .saturating_sub(usize::from(inner.height));
@@ -196,7 +200,18 @@ fn listed(values: &[String]) -> Span<'static> {
     if values.is_empty() { warn("none") } else { ok(values.join(", ")) }
 }
 
-fn detail_text(app: &App, descriptor: &ResourceDescriptor) -> Text<'static> {
+/// A one-line sparkline drawn with block elements so it scrolls with text.
+fn sparkline(values: &[u64]) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().copied().max().unwrap_or(0).max(1);
+    values.iter().map(|value| LEVELS[(value * 7 / max) as usize]).collect()
+}
+
+fn detail_text(
+    app: &App,
+    descriptor: &ResourceDescriptor,
+    width: u16,
+) -> Text<'static> {
     let id = &descriptor.id;
     let mut lines = vec![heading("Identity")];
     lines.push(item("Kind", ok(format!("{:?}", descriptor.kind))));
@@ -231,6 +246,47 @@ fn detail_text(app: &App, descriptor: &ResourceDescriptor) -> Text<'static> {
         format!("{BULLET}{}", resource_health_summary(app, id)),
         Style::default().fg(OX_OFF_WHITE),
     ));
+
+    lines.push(Line::default());
+    lines.push(heading("Traffic"));
+    let traffic = app
+        .observability
+        .telemetry
+        .resources
+        .get(id)
+        .filter(|traffic| traffic.current_at.is_some());
+    match traffic {
+        Some(traffic) => {
+            let rate = traffic.current_rate;
+            let mut rates = vec![Span::styled(
+                format!("{BULLET}Rate: "),
+                Style::default().fg(OX_OFF_WHITE),
+            )];
+            rates.extend(rate_line(rate).spans);
+            lines.push(Line::from(rates));
+            lines.push(item(
+                "Packets",
+                ok(format!(
+                    "RX {:.0}/s · TX {:.0}/s",
+                    rate.rx_packets_sec, rate.tx_packets_sec
+                )),
+            ));
+            let label = format!("{BULLET}History: ");
+            let data = sparkline_data(
+                traffic
+                    .history
+                    .points()
+                    .iter()
+                    .map(|point| point.rate.total_bytes_sec()),
+                width.saturating_sub(terminal_width(&label) as u16),
+            );
+            lines.push(Line::from(vec![
+                Span::styled(label, Style::default().fg(OX_OFF_WHITE)),
+                Span::styled(sparkline(&data), health_style(state)),
+            ]));
+        }
+        None => lines.push(item("Rate", warn("collecting"))),
+    }
 
     if descriptor.kind == ResourceKind::Sled {
         lines.push(Line::default());
@@ -299,6 +355,40 @@ fn detail_text(app: &App, descriptor: &ResourceDescriptor) -> Text<'static> {
         None => lines.push(item("Status", warn("no successful sample"))),
     }
 
+    let mut zones = traffic
+        .into_iter()
+        .flat_map(|traffic| traffic.current_sample.zones.iter())
+        .collect::<Vec<_>>();
+    if !zones.is_empty() {
+        zones.sort_by(|left, right| {
+            right
+                .rate
+                .total_bytes_sec()
+                .total_cmp(&left.rate.total_bytes_sec())
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        lines.push(Line::default());
+        lines.push(heading("Zone traffic"));
+        for zone in zones {
+            let total = zone.rate.total_bytes_sec();
+            let style = super::widgets::traffic_style(
+                TrafficSeverity::for_bytes_per_sec(total),
+            );
+            lines.push(item(
+                &zone.short_name,
+                Span::styled(
+                    format!(
+                        "RX {} · TX {} · Total {}",
+                        format_rate(zone.rate.rx_bytes_sec),
+                        format_rate(zone.rate.tx_bytes_sec),
+                        format_rate(total)
+                    ),
+                    style,
+                ),
+            ));
+        }
+    }
+
     let mut errors = Vec::new();
     if let Some(error) = app
         .observability
@@ -316,6 +406,9 @@ fn detail_text(app: &App, descriptor: &ResourceDescriptor) -> Text<'static> {
         .filter(|error| collection_error_is_visible(app, id, error))
     {
         errors.push(("Addresses", error.message.clone()));
+    }
+    if let Some(error) = visible_traffic_error(app, id) {
+        errors.push(("Traffic", error.message.clone()));
     }
     if !errors.is_empty() {
         lines.push(Line::default());

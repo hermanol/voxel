@@ -13,7 +13,7 @@ use crate::tui::reconcile::{
     ReconciliationResult, RouteEvidence, RssObservation,
 };
 use crate::tui::telemetry::{
-    HealthDiagnostic, NodeAddresses, RackId, ResourceId,
+    HealthDiagnostic, NodeAddresses, RackId, ResourceId, TrafficSample,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -45,10 +45,12 @@ impl DeploymentPane {
 pub enum MonitoringPane {
     RackSummary,
     Topology,
+    TopZones,
 }
 
 impl MonitoringPane {
-    pub(crate) const ORDER: [Self; 2] = [Self::RackSummary, Self::Topology];
+    pub(crate) const ORDER: [Self; 3] =
+        [Self::RackSummary, Self::Topology, Self::TopZones];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,6 +221,16 @@ pub enum AppEvent {
     OperationStartFailed {
         request_id: OperationRequestId,
         kind: OperationKind,
+        message: String,
+    },
+    Traffic {
+        id: ResourceId,
+        at: Instant,
+        sample: TrafficSample,
+    },
+    TrafficFailed {
+        id: ResourceId,
+        at: Instant,
         message: String,
     },
     Health {

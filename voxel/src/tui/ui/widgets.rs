@@ -14,6 +14,7 @@ use super::{
 use crate::tui::{
     app::App,
     event::{Confirmation, View},
+    telemetry::TrafficSeverity,
 };
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -350,6 +351,10 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
                         groups.push(group("Enter", "details"));
                     }
                 }
+                crate::tui::event::MonitoringPane::TopZones => {
+                    groups.push(group("↑/↓", "zones"));
+                    groups.push(group("Pg", if narrow { "" } else { "page" }));
+                }
             }
         }
         if app.session.selected_resource.is_some() {
@@ -412,6 +417,24 @@ fn minimum(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
         .block(primary_block(" VOXEL ")),
         area,
     );
+}
+
+pub fn format_rate(value: f64) -> String {
+    if value >= 1_000_000.0 {
+        format!("{:.1} MB/s", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1} KB/s", value / 1_000.0)
+    } else {
+        format!("{value:.0} B/s")
+    }
+}
+
+pub(crate) fn traffic_style(severity: TrafficSeverity) -> Style {
+    Style::default().fg(match severity {
+        TrafficSeverity::Normal => OX_OFF_WHITE,
+        TrafficSeverity::Elevated => TUI_YELLOW,
+        TrafficSeverity::High => OX_RED,
+    })
 }
 
 // The styles below follow wicket's ui/defaults/style.rs.
@@ -501,7 +524,7 @@ mod tests {
     fn footer_advertises_only_keys_that_act() {
         let descriptor = sled(0, 0);
         let app = |setup: &dyn Fn(&mut App)| {
-            let mut app = App::new(vec![descriptor.clone()], 8);
+            let mut app = App::new(vec![descriptor.clone()], 8, 8);
             setup(&mut app);
             app
         };

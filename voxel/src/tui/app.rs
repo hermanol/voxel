@@ -25,7 +25,7 @@ use crate::tui::reconcile::{
 };
 use crate::tui::telemetry::{
     HealthDiagnostic, LatestSample, NodeAddresses, RackId, ResourceDescriptor,
-    ResourceId,
+    ResourceId, TelemetryModel,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +54,7 @@ pub struct SessionState {
     pub collapsed_deployment: BTreeSet<DeploymentPane>,
     pub collapsed_monitoring: BTreeSet<MonitoringPane>,
     pub phase_scroll: usize,
+    pub top_zones_scroll: usize,
     pub help_scroll: usize,
     pub help_open: bool,
     pub selected_rack: Option<RackId>,
@@ -253,8 +254,10 @@ impl OperationState {
 
 #[derive(Clone, Debug)]
 pub struct ObservabilityState {
+    pub telemetry: TelemetryModel,
     pub health: BTreeMap<ResourceId, LatestSample<HealthDiagnostic>>,
     pub addresses: BTreeMap<ResourceId, LatestSample<NodeAddresses>>,
+    pub traffic_failures: BTreeMap<ResourceId, LatestSample<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,9 +280,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(topology: Vec<ResourceDescriptor>, log_capacity: usize) -> Self {
+    pub fn new(
+        topology: Vec<ResourceDescriptor>,
+        log_capacity: usize,
+        history_capacity: usize,
+    ) -> Self {
         let topology = Self::normalize_topology(topology);
+        let telemetry = TelemetryModel::new(topology.clone(), history_capacity);
         let health = topology
+            .iter()
+            .map(|d| (d.id.clone(), LatestSample::default()))
+            .collect();
+        let traffic_failures = topology
             .iter()
             .map(|d| (d.id.clone(), LatestSample::default()))
             .collect();
@@ -300,6 +312,7 @@ impl App {
                 collapsed_deployment: BTreeSet::new(),
                 collapsed_monitoring: BTreeSet::new(),
                 phase_scroll: 0,
+                top_zones_scroll: 0,
                 help_scroll: 0,
                 help_open: false,
                 selected_rack: None,
@@ -331,7 +344,12 @@ impl App {
                 outcome: None,
                 start_failure: None,
             },
-            observability: ObservabilityState { health, addresses },
+            observability: ObservabilityState {
+                telemetry,
+                health,
+                addresses,
+                traffic_failures,
+            },
             logs: BoundedLogs::new(log_capacity),
             logs_filter: LogFilter::All,
             durable_log_path: "voxel-tui.log".into(),
@@ -395,6 +413,38 @@ impl App {
                     self.operation.pending = None;
                     self.operation.start_failure = Some(message);
                     self.session.post_operation_exit = None;
+                }
+            }
+            AppEvent::Traffic { id, at, sample } => {
+                if self
+                    .observability
+                    .traffic_failures
+                    .get(&id)
+                    .is_some_and(|failures| Self::accept_attempt(failures, at))
+                {
+                    self.observability
+                        .telemetry
+                        .set_current_sample(&id, at, sample);
+                    self.observability.telemetry.rebuild_aggregates(at);
+                    self.observability
+                        .traffic_failures
+                        .entry(id)
+                        .or_default()
+                        .record_success(at, ());
+                }
+            }
+            AppEvent::TrafficFailed { id, at, message } => {
+                if self
+                    .observability
+                    .traffic_failures
+                    .get(&id)
+                    .is_some_and(|failures| Self::accept_attempt(failures, at))
+                {
+                    self.observability
+                        .traffic_failures
+                        .entry(id)
+                        .or_default()
+                        .record_error(at, message);
                 }
             }
             AppEvent::Health { id, at, diagnostic } => {
@@ -500,6 +550,12 @@ impl App {
         let rack =
             |rack: &RackId, what: &str| format!("rack {} {what}", rack.0);
         let (source, error) = match event {
+            AppEvent::TrafficFailed { id, message, .. } => {
+                (format!("{} traffic", self.resource_label(id)), Some(message))
+            }
+            AppEvent::Traffic { id, .. } => {
+                (format!("{} traffic", self.resource_label(id)), None)
+            }
             AppEvent::HealthFailed { id, message, .. } => {
                 (format!("{} health", self.resource_label(id)), Some(message))
             }
@@ -717,6 +773,7 @@ impl App {
                             self.session.selected_resource = next;
                         }
                     }
+                    MonitoringPane::TopZones => {}
                 }
             }
             Action::NextSection => self.move_section(Direction::Next),
@@ -844,6 +901,29 @@ impl App {
                     }
                 }
                 View::Deployment => {}
+                View::Monitor
+                    if self.session.monitoring_pane
+                        == MonitoringPane::TopZones
+                        && self
+                            .session
+                            .monitoring_expanded(MonitoringPane::TopZones) =>
+                {
+                    let amount =
+                        crate::tui::ui::monitor::top_zones_page_capacity(self)
+                            as isize;
+                    if amount > 0 {
+                        let maximum = crate::tui::ui::monitor::top_zones_len(
+                            self,
+                            self.session.selected_rack,
+                        )
+                        .saturating_sub(amount as usize);
+                        let current =
+                            self.session.top_zones_scroll.min(maximum);
+                        self.session.top_zones_scroll = current
+                            .saturating_add_signed(delta.saturating_mul(amount))
+                            .min(maximum);
+                    }
+                }
                 View::Monitor => {}
             },
             _ => {}
@@ -1064,6 +1144,7 @@ impl App {
             self.session.selected_rack.as_ref(),
             direction,
         );
+        self.session.top_zones_scroll = 0;
         self.repair_resource();
     }
     fn move_resource(&mut self, direction: Direction) {
@@ -1171,6 +1252,27 @@ impl App {
                 if next.is_some() {
                     self.session.selected_resource = next;
                 }
+            }
+            View::Monitor
+                if self.session.monitoring_pane == MonitoringPane::TopZones
+                    && self
+                        .session
+                        .monitoring_expanded(MonitoringPane::TopZones) =>
+            {
+                let capacity =
+                    crate::tui::ui::monitor::top_zones_page_capacity(self);
+                if capacity == 0 {
+                    return;
+                }
+                let maximum = crate::tui::ui::monitor::top_zones_len(
+                    self,
+                    self.session.selected_rack,
+                )
+                .saturating_sub(capacity);
+                let current = self.session.top_zones_scroll.min(maximum);
+                let candidate =
+                    current.saturating_add_signed(delta).min(maximum);
+                self.session.top_zones_scroll = candidate;
             }
             _ => {}
         }
@@ -1430,7 +1532,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     fn active_app() -> App {
-        let mut app = App::new(vec![], 8);
+        let mut app = App::new(vec![], 8, 8);
         app.operation.active = Some(ActiveOperation::new(
             OperationRequestId::FIRST,
             OperationKind::Launch,
@@ -1477,7 +1579,7 @@ mod tests {
             at,
             observation: RssObservation::Initialized { id: "rack".into() },
         };
-        let mut app = App::new(vec![], 8);
+        let mut app = App::new(vec![], 8, 8);
 
         let recorded = [
             unreachable("connect refused"),
@@ -1574,7 +1676,7 @@ mod tests {
         let cases = [
             (
                 "quit and destroy",
-                App::new(vec![], 8),
+                App::new(vec![], 8, 8),
                 Action::RequestQuit,
                 Confirmation::QuitAndDestroy,
             ),

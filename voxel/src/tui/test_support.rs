@@ -12,7 +12,9 @@ use crossterm::event::KeyCode;
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer};
 use voxel_config::VoxelConfig;
 
-use super::telemetry::{RackId, ResourceDescriptor, ResourceId, ResourceKind};
+use super::telemetry::{
+    BidirectionalRate, RackId, ResourceDescriptor, ResourceId, ResourceKind,
+};
 
 /// Parse a `voxel.toml` snippet, written as a user would write it.
 pub(crate) fn config(toml: &str) -> VoxelConfig {
@@ -55,6 +57,10 @@ pub(crate) fn router(name: &str) -> ResourceDescriptor {
         host: None,
         slot: None,
     }
+}
+
+pub(crate) fn rate(rx_bytes_sec: f64, tx_bytes_sec: f64) -> BidirectionalRate {
+    BidirectionalRate { rx_bytes_sec, tx_bytes_sec, ..Default::default() }
 }
 
 /// The keys a footer or help label names, such as `"↑/↓"` or
