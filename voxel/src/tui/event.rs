@@ -13,7 +13,8 @@ use crate::tui::reconcile::{
     ReconciliationResult, RouteEvidence, RssObservation,
 };
 use crate::tui::telemetry::{
-    HealthDiagnostic, NodeAddresses, RackId, ResourceId, TrafficSample,
+    HealthDiagnostic, NodeAddresses, OximeterExceptions, RackId, ResourceId,
+    TrafficSample, ZfsHeadroom, ZoneCpu,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -180,6 +181,8 @@ pub enum Action {
     Activate,
     ToggleSection,
     ToggleHelp,
+    CopyExternalMonitoringYaml,
+    CopyExternalMonitoringGuide,
     Close,
     RequestLaunch,
     RequestRoute,
@@ -228,6 +231,25 @@ pub enum AppEvent {
         at: Instant,
         sample: TrafficSample,
     },
+    OximeterTraffic {
+        id: ResourceId,
+        at: Instant,
+        samples: Vec<(Instant, TrafficSample)>,
+    },
+    OximeterTrafficFailed {
+        rack: RackId,
+        at: Instant,
+        message: String,
+    },
+    NexusAvailable {
+        rack: RackId,
+        at: Instant,
+    },
+    NexusUnavailable {
+        rack: RackId,
+        at: Instant,
+        message: String,
+    },
     TrafficFailed {
         id: ResourceId,
         at: Instant,
@@ -240,6 +262,36 @@ pub enum AppEvent {
     },
     HealthFailed {
         id: ResourceId,
+        at: Instant,
+        message: String,
+    },
+    ZoneCpu {
+        rack: RackId,
+        at: Instant,
+        zones: Vec<ZoneCpu>,
+    },
+    ZoneCpuFailed {
+        rack: RackId,
+        at: Instant,
+        message: String,
+    },
+    ZfsHeadroom {
+        rack: RackId,
+        at: Instant,
+        pools: Vec<ZfsHeadroom>,
+    },
+    ZfsHeadroomFailed {
+        rack: RackId,
+        at: Instant,
+        message: String,
+    },
+    OximeterExceptions {
+        rack: RackId,
+        at: Instant,
+        exceptions: OximeterExceptions,
+    },
+    OximeterExceptionsFailed {
+        rack: RackId,
         at: Instant,
         message: String,
     },

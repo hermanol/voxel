@@ -13,6 +13,7 @@ mod context;
 mod effects;
 mod event;
 mod logging;
+mod nexus;
 mod operation;
 mod phase;
 mod process;
@@ -117,7 +118,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         Duration::from_secs(10),
     ));
     let collector =
-        Arc::new(collector::Collector::new(executor.clone(), &context.config));
+        Arc::new(collector::Collector::new(executor.clone(), &context.config)?);
     let schedule = collector::SchedulerConfig::new(
         Duration::from_secs(2),
         Duration::from_secs(10),
@@ -152,6 +153,12 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         app.logs.push(app::LogEntry::application(level, message));
     }
     app.reattach_command = Some(reattach);
+    app.external_monitoring_endpoints = (0..context.config.topology.racks())
+        .map(|rack| {
+            let name = nexus::nexus_name(&context.config, rack);
+            (telemetry::RackId(rack), format!("https://{name}/"))
+        })
+        .collect();
 
     let mut input = terminal::spawn_input(events_tx.clone(), shutdown.clone());
     let mut ticks = terminal::spawn_ticks(

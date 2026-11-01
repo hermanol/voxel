@@ -144,14 +144,26 @@ pub(crate) fn detail_area(app: &App) -> Option<Rect> {
 pub(crate) fn resource_health_state(app: &App, id: &ResourceId) -> HealthState {
     let kind = resource_kind(app, id);
     if kind != Some(ResourceKind::Sled) {
-        // Switch zones and routers report no service diagnostics, so their
-        // health is whether their traffic probe still answers.
-        return app
-            .observability
-            .traffic_failures
-            .get(id)
-            .map(|sample| collection_health_state(app, sample))
-            .unwrap_or(HealthState::Unavailable);
+        // A slow Oximeter cycle must not mark a node down while its direct
+        // probe still answers, so the fresher of the two decides.
+        let shown = app.observability.traffic_failures.get(id);
+        let direct = app.observability.direct_traffic.get(id);
+        // A source that has never reported says nothing, so it ranks below
+        // one that has reported a failure.
+        let rank = |state: HealthState| match state {
+            HealthState::Healthy => 3,
+            HealthState::Stale => 2,
+            HealthState::Unavailable => 1,
+            _ => 0,
+        };
+        return [
+            shown.map(|sample| collection_health_state(app, sample)),
+            direct.map(|sample| collection_health_state(app, sample)),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|state| rank(*state))
+        .unwrap_or(HealthState::Unavailable);
     }
     let Some(sample) = app.observability.health.get(id) else {
         return HealthState::Unavailable;
@@ -218,6 +230,7 @@ fn resource_last_success(
         })
     } else {
         last_good(app.observability.traffic_failures.get(id))
+            .max(last_good(app.observability.direct_traffic.get(id)))
     }
 }
 
@@ -459,9 +472,13 @@ fn draw_top_zones(
         .min(zones.len().saturating_sub(capacity.max(1)));
     let end = start.saturating_add(capacity).min(zones.len());
     let title = if capacity > 0 && zones.len() > capacity {
-        format!("Top Zones by Traffic {}-{end} of {}", start + 1, zones.len())
+        format!(
+            "Top Zones by Traffic + CPU {}-{end} of {}",
+            start + 1,
+            zones.len()
+        )
     } else {
-        "Top Zones by Traffic".into()
+        "Top Zones by Traffic + CPU".into()
     };
     let block = section_block(
         title,
@@ -486,18 +503,34 @@ fn draw_top_zones(
         frame.render_widget(Paragraph::new(sample).block(block), area);
         return;
     }
-    let header = Row::new(["Resource", "Zone", "Total"])
+    let header = Row::new(["Resource", "Zone", "Total", "CPU", "Wait"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows = zones
         .iter()
         .skip(start)
         .take(capacity)
-        .map(|(_, resource, zone)| {
+        .map(|(resource_id, resource, zone)| {
             let rates = zone_rate_cells(zone.rate);
+            let cpu = rack
+                .and_then(|rack| app.observability.zone_cpu.get(&rack))
+                .and_then(|sample| sample.good.as_ref())
+                .and_then(|sample| {
+                    sample.value.iter().find(|cpu| {
+                        cpu.id == **resource_id && cpu.name == zone.name
+                    })
+                });
             Row::new([
                 Cell::from((*resource).clone()),
                 Cell::from(zone.short_name.clone()),
                 rates[2].clone(),
+                Cell::from(
+                    cpu.map(|cpu| format!("{:.1}%", cpu.total_percent()))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(
+                    cpu.map(|cpu| format!("{:.1}%", cpu.wait_percent))
+                        .unwrap_or_else(|| "—".into()),
+                ),
             ])
         })
         .collect::<Vec<_>>();
@@ -511,9 +544,11 @@ fn draw_top_zones(
             Table::new(
                 rows,
                 [
-                    Constraint::Percentage(30),
-                    Constraint::Percentage(45),
-                    Constraint::Percentage(25),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(15),
+                    Constraint::Percentage(15),
                 ],
             )
             .header(header)
@@ -538,13 +573,16 @@ pub(crate) fn zone_rate_cells(rate: BidirectionalRate) -> [Cell<'static>; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_support::{rate, render, router, sled, switch, text};
+    use crate::tui::reconcile::{ObservedDeploymentState, RouteEvidence};
+    use crate::tui::test_support::{
+        rate, render, router, sample, sled, switch, text,
+    };
     use crate::tui::{
         app::TerminalSize,
         event::AppEvent,
         telemetry::{
             HealthDiagnostic, NtpDiagnostic, RackId, ServiceState,
-            TrafficSample, ZoneTraffic,
+            TrafficSample, TrafficSource, ZoneTraffic,
         },
     };
     use std::time::Instant;
@@ -560,16 +598,19 @@ mod tests {
         // (case, resource, [(when, event, health)], final summary)
         let cases = [
             (
-                "switch whose traffic probe stops answering",
+                "switch whose Oximeter samples stop while direct probes answer",
                 switch_zone.clone(),
                 vec![
                     ("before any sample", tick(0), HealthState::Checking),
                     (
-                        "after a traffic sample",
-                        AppEvent::Traffic {
+                        "after an Oximeter sample",
+                        AppEvent::OximeterTraffic {
                             id: switch_zone.id.clone(),
                             at: at(0),
-                            sample: TrafficSample::default(),
+                            samples: vec![(
+                                at(0),
+                                sample(0.0, TrafficSource::Oximeter),
+                            )],
                         },
                         HealthState::Healthy,
                     ),
@@ -579,7 +620,7 @@ mod tests {
                         HealthState::Unavailable,
                     ),
                     (
-                        "after the probe answers again",
+                        "after a direct probe success in the Oximeter gap",
                         AppEvent::Traffic {
                             id: switch_zone.id.clone(),
                             at: at(300),
@@ -636,6 +677,18 @@ mod tests {
         }
     }
 
+    fn rack_summary_text(app: &App) -> String {
+        text(&render(120, 5, |frame| {
+            super::super::rack_selector::draw(
+                frame,
+                frame.area(),
+                app,
+                true,
+                true,
+            )
+        }))
+    }
+
     fn node_details_text(app: &App) -> String {
         text(&render(100, 40, |frame| {
             super::super::node_detail::draw(frame, frame.area(), app, false)
@@ -665,14 +718,51 @@ mod tests {
         let now = Instant::now();
         let log = "/work/voxel-tui.log";
 
-        // A failed health probe: a sled's details explain the missing
-        // diagnostics and where the errors are logged.
-        let sled = sled(0, 3);
-        let mut app = app_selecting(sled.clone());
-        app.update(AppEvent::HealthFailed {
-            id: sled.id,
+        // Nexus outage: the rack summary names the outage, the log and the
+        // likely cause until Nexus answers again.
+        let rack = RackId(0);
+        let mut app = App::new(vec![sled(0, 0)], 4, 4);
+        app.update(AppEvent::NexusUnavailable {
+            rack,
             at: now,
-            message: "sled-agent state timed out".into(),
+            message: "Nexus is unavailable".into(),
+        });
+        app.durable_log_path = log.into();
+        assert_shows(
+            &rack_summary_text(&app),
+            &[
+                "Nexus/control plane unavailable · direct-probe fallback \
+                 enabled · log: /work/voxel-tui.log",
+                "No host route to the rack's external network",
+            ],
+        );
+        app.deployment.routes = RouteEvidence::Applied;
+        assert_shows(
+            &rack_summary_text(&app),
+            &["traffic, CPU, ZFS, collector health may be stale"],
+        );
+        // The traffic history takes the banner's place once Nexus answers.
+        app.update(AppEvent::NexusAvailable {
+            rack,
+            at: now + Duration::from_secs(1),
+        });
+        assert_shows(
+            &rack_summary_text(&app),
+            &["Rack traffic (this TUI session)"],
+        );
+
+        // Oximeter queries failing: a sled's details explain each missing
+        // diagnostic and where the errors are logged.
+        let mut app = app_selecting(sled(0, 3));
+        app.update(AppEvent::ZoneCpuFailed {
+            rack,
+            at: now,
+            message: "CPU query timed out".into(),
+        });
+        app.update(AppEvent::ZfsHeadroomFailed {
+            rack,
+            at: now,
+            message: "ZFS response omitted a pool".into(),
         });
         app.durable_log_path = log.into();
         assert_shows(
@@ -680,7 +770,8 @@ mod tests {
             &[
                 "no successful health sample",
                 "Errors · logged to /work/voxel-tui.log",
-                "Health: sled-agent state timed out",
+                "Zone CPU unavailable: CPU query timed out",
+                "ZFS unavailable: ZFS response omitted a pool",
             ],
         );
 
@@ -733,6 +824,7 @@ mod tests {
                         name: format!("zone-{index}"),
                         short_name: format!("zone-{index}"),
                         rate: rate((8 - index) as f64, 0.0),
+                        errors: Default::default(),
                     })
                     .collect(),
                 ..Default::default()
@@ -758,7 +850,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(visible, ["zone-1", "zone-2", "zone-3", "zone-4"], "{page}");
-        assert_shows(&page, &["Top Zones by Traffic 2-5 of 8"]);
+        assert_shows(&page, &["Top Zones by Traffic + CPU 2-5 of 8"]);
 
         // At this size Top Zones shows only its borders and header.
         app.session.terminal = TerminalSize { width: 48, height: 16 };

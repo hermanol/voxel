@@ -131,6 +131,9 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         Paragraph::new(guidance_lines(app, root.footer.width)),
         root.footer,
     );
+    if app.session.external_monitoring_open {
+        super::external_monitoring::draw(frame);
+    }
     if app.session.help_open {
         super::help::draw(frame, app);
     }
@@ -320,6 +323,13 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
             group("n/Esc", "back"),
         ];
     }
+    if app.session.external_monitoring_open {
+        return vec![
+            group("s", "copy YAML"),
+            group("a", "copy guide"),
+            group("Esc", "close"),
+        ];
+    }
     if app.session.help_open {
         let mut groups = vec![group("↑/↓", "scroll"), group("?/Esc", "close")];
         groups.extend(lifecycle());
@@ -363,6 +373,7 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
         groups.extend([
             group(contextual_navigation, "section"),
             group("v", "view"),
+            group("x", if narrow { "" } else { "external monitoring" }),
         ]);
         groups.extend(lifecycle());
         groups.push(group("?", "help"));
@@ -530,7 +541,7 @@ mod tests {
         };
         let monitor = |app: &mut App| app.session.view = View::Monitor;
         // (case, app, group shown, group prefix not shown)
-        let cases: [(&str, App, &str, Option<&str>); 7] = [
+        let cases: [(&str, App, &str, Option<&str>); 8] = [
             (
                 "deployment idle",
                 app(&|app| {
@@ -556,7 +567,7 @@ mod tests {
                 "x destroy",
                 None,
             ),
-            ("monitor", app(&monitor), "↑↓←→ node", None),
+            ("monitor", app(&monitor), "x external monitoring", None),
             (
                 "node details",
                 app(&|app| {
@@ -577,6 +588,15 @@ mod tests {
                 "confirmation",
                 app(&|app| app.session.confirmation = Some(Confirmation::Quit)),
                 "y confirm",
+                None,
+            ),
+            (
+                "external monitoring",
+                app(&|app| {
+                    monitor(app);
+                    app.session.external_monitoring_open = true;
+                }),
+                "a copy guide",
                 None,
             ),
         ];

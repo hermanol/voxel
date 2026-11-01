@@ -4,7 +4,8 @@
 
 //! Periodic telemetry collection. Probes sleds and routers over Falcon
 //! serial and SSH for link counters, addresses, service health and RSS
-//! progress, and publishes the samples as [`AppEvent`]s on a bounded
+//! progress, queries Nexus with OxQL for oximeter metrics once the control
+//! plane is up, and publishes the samples as [`AppEvent`]s on a bounded
 //! schedule.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,7 +13,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow, ensure};
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::{StreamExt, stream};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -20,12 +22,17 @@ use tokio_util::sync::CancellationToken;
 use voxel_config::VoxelConfig;
 
 use crate::tui::event::AppEvent;
+use crate::tui::nexus::{
+    MetricType, MissingTimeseries, NexusClient, OxqlQueryResult, RecoveryLogin,
+    TimeseriesExt,
+};
 use crate::tui::reconcile::{parse_rss_observation, rss_probe_command};
 use crate::tui::telemetry::{
-    CounterSnapshot, HealthDiagnostic, RackId, ResourceId, ResourceKind,
-    ResourceTelemetry, TrafficSample, parse_chrony_tracking,
-    parse_dladm_zone_vnics, parse_failed_services, parse_ipadm_addresses,
-    parse_kstat_link_counters, parse_linux_ip_addresses,
+    BidirectionalErrors, BidirectionalRate, CounterSnapshot, HealthDiagnostic,
+    OximeterExceptions, RackId, ResourceId, ResourceKind, ResourceTelemetry,
+    TrafficSample, TrafficSource, ZfsHeadroom, ZoneCpu, ZoneTraffic,
+    parse_chrony_tracking, parse_dladm_zone_vnics, parse_failed_services,
+    parse_ipadm_addresses, parse_kstat_link_counters, parse_linux_ip_addresses,
     parse_linux_link_counters, parse_service_state, parse_zone_diagnostics,
     resource_descriptors,
 };
@@ -38,6 +45,459 @@ const LINUX_ADDRESSES: &str = "ip -o addr show";
 const SLED_AGENT_STATE: &str = "svcs -H -o state svc:/oxide/sled-agent:default";
 const MAINTENANCE_SERVICES: &str =
     "svcs -H -o state,fmri -a | awk '$1 == \"maintenance\" { print $2 }'";
+const OXIMETER_TRAFFIC_METRICS: [&str; 6] = [
+    "sled_data_link:bytes_received",
+    "sled_data_link:bytes_sent",
+    "sled_data_link:packets_received",
+    "sled_data_link:packets_sent",
+    "sled_data_link:errors_received",
+    "sled_data_link:errors_sent",
+];
+const OXIMETER_INTERVAL: Duration = Duration::from_secs(30);
+const NEXUS_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const ZONE_CPU_ALIGNMENT: Duration = Duration::from_secs(10);
+const ZONE_CPU_QUERY: &str = "get zone:cpu_nsec
+    | filter timestamp > @now() - 2m
+    | align mean_within(10s)
+    | group_by [sled_serial, zone_name, zone_type, state], sum
+    | filter datum >= 0.0
+    | last 1";
+const ZFS_ALLOCATED_QUERY: &str = "get zfs_pool:bytes_allocated | last 1";
+const ZFS_TOTAL_QUERY: &str = "get zfs_pool:bytes_total | last 1";
+/// Asked one at a time: the collector registers each counter with the first
+/// event it counts, and Nexus rejects a query naming any timeseries that does
+/// not exist yet.
+fn oximeter_exception_queries() -> [String; 2] {
+    let minutes = OximeterExceptions::WINDOW.as_secs() / 60;
+    [
+        "oximeter_collector:failed_collections",
+        "oximeter_collector:database_samples_dropped",
+    ]
+    .map(|name| format!("get {name} | filter timestamp > @now() - {minutes}m"))
+}
+
+fn oximeter_traffic_queries(
+    rack: RackId,
+    sled_serials: &BTreeMap<String, (RackId, String, bool)>,
+) -> Vec<String> {
+    sled_serials
+        .iter()
+        .filter(|(_, (sled_rack, _, _))| *sled_rack == rack)
+        .flat_map(|(serial, _)| {
+            let serial = serde_json::to_string(serial)
+                .expect("a string always serializes as JSON");
+            OXIMETER_TRAFFIC_METRICS.into_iter().map(move |metric| {
+                format!(
+                    "get {metric} | filter sled_serial == {serial} | last 1"
+                )
+            })
+        })
+        .collect()
+}
+
+fn oximeter_due(
+    attempts: &BTreeMap<RackId, Instant>,
+    rack: RackId,
+    now: Instant,
+) -> bool {
+    !attempts.get(&rack).is_some_and(|previous| {
+        now.duration_since(*previous) < OXIMETER_INTERVAL
+    })
+}
+
+#[derive(Default)]
+struct PartialLinkRate {
+    rate: BidirectionalRate,
+    errors: BidirectionalErrors,
+    present: u8,
+}
+
+#[derive(Default)]
+struct PartialTrafficSample {
+    timestamp: Option<DateTime<Utc>>,
+    links: BTreeMap<(String, String), PartialLinkRate>,
+}
+
+fn oximeter_sample_instant(timestamp: DateTime<Utc>, now: Instant) -> Instant {
+    Utc::now()
+        .signed_duration_since(timestamp)
+        .to_std()
+        .ok()
+        .and_then(|age| now.checked_sub(age))
+        .unwrap_or(now)
+}
+
+fn oximeter_resource_ids(
+    rack: RackId,
+    serial: &str,
+    zone: &str,
+    sled_serials: &BTreeMap<String, (RackId, String, bool)>,
+) -> anyhow::Result<Vec<ResourceId>> {
+    let (sled_rack, sled, scrimlet) = sled_serials
+        .get(serial)
+        .with_context(|| format!("unknown Oximeter sled serial {serial}"))?;
+    ensure!(*sled_rack == rack, "Oximeter sled belongs to another rack");
+    let mut ids = vec![ResourceId::rack(rack, ResourceKind::Sled, sled)];
+    if zone.starts_with("oxz_switch") && *scrimlet {
+        ids.push(ResourceId::rack(rack, ResourceKind::SwitchZone, sled));
+    }
+    Ok(ids)
+}
+
+fn parse_oximeter_traffic(
+    result: OxqlQueryResult,
+    rack: RackId,
+    sled_serials: &BTreeMap<String, (RackId, String, bool)>,
+    now: Instant,
+) -> anyhow::Result<BTreeMap<ResourceId, Vec<(Instant, TrafficSample)>>> {
+    const TABLES: [&str; 6] = [
+        "sled_data_link:bytes_received",
+        "sled_data_link:bytes_sent",
+        "sled_data_link:packets_received",
+        "sled_data_link:packets_sent",
+        "sled_data_link:errors_received",
+        "sled_data_link:errors_sent",
+    ];
+    ensure!(
+        TABLES.iter().all(|required| result
+            .tables
+            .iter()
+            .any(|table| table.name == *required)),
+        "Oximeter traffic response omitted a required table"
+    );
+    let mut partial = BTreeMap::<ResourceId, PartialTrafficSample>::new();
+    for table in result.tables {
+        let field =
+            TABLES.iter().position(|name| *name == table.name).ok_or_else(
+                || anyhow!("unexpected Oximeter traffic table {}", table.name),
+            )?;
+        for series in table.timeseries {
+            let serial = series
+                .field("sled_serial")
+                .context("Oximeter link series omitted sled_serial")?;
+            let zone = series
+                .field("zone_name")
+                .context("Oximeter link series omitted zone_name")?;
+            let link = series
+                .field("link_name")
+                .context("Oximeter link series omitted link_name")?;
+            let ids = oximeter_resource_ids(rack, serial, zone, sled_serials)?;
+            ensure!(
+                series.points.values.first().is_some_and(|column| {
+                    column.metric_type == MetricType::Delta
+                }),
+                "Oximeter link counter was not converted to deltas"
+            );
+            let points = series.integer_points()?;
+            ensure!(
+                points.len() == 1,
+                "Oximeter traffic query did not return the latest sample"
+            );
+            for (start, timestamp, value) in points {
+                let start =
+                    start.context("Oximeter link delta omitted start time")?;
+                let seconds = timestamp
+                    .signed_duration_since(start)
+                    .to_std()
+                    .context("Oximeter link delta has an invalid interval")?
+                    .as_secs_f64();
+                ensure!(seconds > 0.0, "Oximeter link delta interval is empty");
+                let value = value.context("Oximeter link delta is null")?;
+                ensure!(value >= 0, "Oximeter link delta is negative");
+                for id in &ids {
+                    let sample = partial.entry(id.clone()).or_default();
+                    sample.timestamp =
+                        Some(sample.timestamp.map_or(timestamp, |current| {
+                            current.max(timestamp)
+                        }));
+                    let rate = sample
+                        .links
+                        .entry((zone.to_owned(), link.to_owned()))
+                        .or_default();
+                    let value = value as f64 / seconds;
+                    match field {
+                        0 => rate.rate.rx_bytes_sec = value,
+                        1 => rate.rate.tx_bytes_sec = value,
+                        2 => rate.rate.rx_packets_sec = value,
+                        3 => rate.rate.tx_packets_sec = value,
+                        4 => rate.errors.rx_sec = value,
+                        5 => rate.errors.tx_sec = value,
+                        _ => unreachable!(),
+                    }
+                    rate.present |= 1 << field;
+                }
+            }
+        }
+    }
+    let mut samples =
+        BTreeMap::<ResourceId, Vec<(Instant, TrafficSample)>>::new();
+    for (id, partial) in partial {
+        let timestamp = partial
+            .timestamp
+            .context("Oximeter traffic sample omitted its timestamp")?;
+        let mut sample = TrafficSample {
+            source: TrafficSource::Oximeter,
+            ..Default::default()
+        };
+        let mut zones =
+            BTreeMap::<String, (BidirectionalRate, BidirectionalErrors)>::new();
+        for ((zone, link), rate) in partial.links {
+            ensure!(
+                rate.present == 0b11_1111,
+                "Oximeter link sample is incomplete"
+            );
+            sample.total += rate.rate;
+            sample.errors.rx_sec += rate.errors.rx_sec;
+            sample.errors.tx_sec += rate.errors.tx_sec;
+            sample.links.insert(format!("{zone}/{link}"), rate.rate);
+            if zone != "global" {
+                let entry = zones.entry(zone).or_default();
+                entry.0 += rate.rate;
+                entry.1.rx_sec += rate.errors.rx_sec;
+                entry.1.tx_sec += rate.errors.tx_sec;
+            }
+        }
+        sample.zones = zones
+            .into_iter()
+            .map(|(name, (rate, errors))| ZoneTraffic {
+                short_name: name
+                    .strip_prefix("oxz_")
+                    .unwrap_or(&name)
+                    .split('_')
+                    .next()
+                    .unwrap_or(&name)
+                    .to_owned(),
+                name,
+                rate,
+                errors,
+            })
+            .collect();
+        ensure!(!sample.links.is_empty(), "Oximeter traffic sample is empty");
+        samples
+            .entry(id)
+            .or_default()
+            .push((oximeter_sample_instant(timestamp, now), sample));
+    }
+    ensure!(
+        !samples.is_empty(),
+        "Oximeter traffic response contained no samples"
+    );
+    Ok(samples)
+}
+
+fn parse_zone_cpu(
+    result: OxqlQueryResult,
+    rack: RackId,
+    sled_serials: &BTreeMap<String, (RackId, String, bool)>,
+) -> anyhow::Result<Vec<ZoneCpu>> {
+    let table = result
+        .tables
+        .into_iter()
+        .find(|table| table.name == "zone:cpu_nsec")
+        .context("Oximeter response omitted zone:cpu_nsec")?;
+    let mut zones = BTreeMap::<(ResourceId, String, String), ZoneCpu>::new();
+    for series in table.timeseries {
+        let serial = series
+            .field("sled_serial")
+            .context("zone CPU series omitted sled_serial")?;
+        ensure!(
+            sled_serials.get(serial).is_some_and(|(r, _, _)| *r == rack),
+            "zone CPU series belongs to another rack"
+        );
+        let name = series
+            .field("zone_name")
+            .context("zone CPU series omitted zone_name")?;
+        let kind = series
+            .field("zone_type")
+            .context("zone CPU series omitted zone_type")?;
+        let state =
+            series.field("state").context("zone CPU series omitted state")?;
+        let ids = oximeter_resource_ids(rack, serial, name, sled_serials)?;
+        let metric_type = series
+            .points
+            .values
+            .first()
+            .map(|value| value.metric_type)
+            .context("zone CPU series omitted values")?;
+        ensure!(
+            matches!(metric_type, MetricType::Delta | MetricType::Gauge),
+            "zone CPU metric has an unsupported type"
+        );
+        let mut latest = None;
+        for (start, timestamp, value) in series.numeric_points()? {
+            let seconds = match metric_type {
+                MetricType::Delta => timestamp
+                    .signed_duration_since(
+                        start.context("zone CPU delta omitted start time")?,
+                    )
+                    .to_std()
+                    .context("zone CPU delta has an invalid interval")?
+                    .as_secs_f64(),
+                MetricType::Gauge => ZONE_CPU_ALIGNMENT.as_secs_f64(),
+                MetricType::Cumulative => unreachable!(),
+            };
+            ensure!(seconds > 0.0, "zone CPU delta interval is empty");
+            let percent = value
+                .map(|value| {
+                    ensure!(
+                        value.is_finite() && value >= 0.0,
+                        "zone CPU value is invalid"
+                    );
+                    Ok(value / 1_000_000_000.0 / seconds * 100.0)
+                })
+                .transpose()?;
+            if latest.as_ref().is_none_or(|(latest_timestamp, _)| {
+                timestamp > *latest_timestamp
+            }) {
+                latest = Some((timestamp, percent));
+            }
+        }
+        let percent = latest
+            .context("zone CPU series has no samples")?
+            .1
+            .context("latest zone CPU delta is null")?;
+        for id in ids {
+            let zone = zones
+                .entry((id.clone(), name.into(), kind.into()))
+                .or_insert_with(|| ZoneCpu {
+                    id,
+                    name: name.into(),
+                    kind: kind.into(),
+                    user_percent: 0.0,
+                    system_percent: 0.0,
+                    wait_percent: 0.0,
+                });
+            match state {
+                "user" => zone.user_percent += percent,
+                "sys" => zone.system_percent += percent,
+                "waitrq" => zone.wait_percent += percent,
+                _ => return Err(anyhow!("unknown zone CPU state {state}")),
+            }
+        }
+    }
+    Ok(zones.into_values().collect())
+}
+
+fn parse_zfs_headroom(
+    result: OxqlQueryResult,
+    rack: RackId,
+    sled_serials: &BTreeMap<String, (RackId, String, bool)>,
+) -> anyhow::Result<Vec<ZfsHeadroom>> {
+    let mut pools =
+        BTreeMap::<(ResourceId, String), (Option<u64>, Option<u64>)>::new();
+    for table in result.tables {
+        let field = match table.name.as_str() {
+            "zfs_pool:bytes_allocated" => 0,
+            "zfs_pool:bytes_total" => 1,
+            _ => continue,
+        };
+        for series in table.timeseries {
+            ensure!(
+                series
+                    .points
+                    .values
+                    .first()
+                    .is_some_and(|v| v.metric_type == MetricType::Gauge),
+                "ZFS headroom metric is not a gauge"
+            );
+            let serial = series
+                .field("sled_serial")
+                .context("ZFS series omitted sled_serial")?;
+            let (sled_rack, sled, _) = sled_serials
+                .get(serial)
+                .context("ZFS series has unknown sled_serial")?;
+            ensure!(*sled_rack == rack, "ZFS series belongs to another rack");
+            let pool = series
+                .field("pool_name")
+                .context("ZFS series omitted pool_name")?;
+            let value = series
+                .integer_points()?
+                .into_iter()
+                .filter_map(|(_, _, value)| value)
+                .next_back()
+                .context("ZFS series has no value")?;
+            ensure!(value >= 0, "ZFS byte gauge is negative");
+            let pair = pools
+                .entry((
+                    ResourceId::rack(rack, ResourceKind::Sled, sled),
+                    pool.into(),
+                ))
+                .or_default();
+            if field == 0 {
+                pair.0 = Some(value as u64)
+            } else {
+                pair.1 = Some(value as u64)
+            }
+        }
+    }
+    pools
+        .into_iter()
+        .map(|((id, pool), (allocated, total))| {
+            let allocated_bytes =
+                allocated.context("ZFS pool omitted allocated bytes")?;
+            let total_bytes = total.context("ZFS pool omitted total bytes")?;
+            ensure!(
+                allocated_bytes <= total_bytes,
+                "ZFS pool allocation exceeds total"
+            );
+            Ok(ZfsHeadroom { id, pool, allocated_bytes, total_bytes })
+        })
+        .collect()
+}
+
+fn parse_oximeter_exceptions(
+    result: OxqlQueryResult,
+) -> anyhow::Result<OximeterExceptions> {
+    // OxQL turns each counter's first sample in the window into a delta from
+    // the counter's start, which carries every event since the collector
+    // started. Only deltas that begin within the window are recent. The
+    // window is measured back from the newest sample, so the rack's clock
+    // decides it, not this host's.
+    let Some(newest) = result
+        .tables
+        .iter()
+        .flat_map(|table| &table.timeseries)
+        .flat_map(|series| &series.points.timestamps)
+        .max()
+    else {
+        return Ok(OximeterExceptions::default());
+    };
+    let window_start =
+        *newest - chrono::TimeDelta::from_std(OximeterExceptions::WINDOW)?;
+    let mut exceptions = OximeterExceptions::default();
+    for table in result.tables {
+        let target = match table.name.as_str() {
+            "oximeter_collector:failed_collections" => {
+                &mut exceptions.failed_collections
+            }
+            "oximeter_collector:database_samples_dropped" => {
+                &mut exceptions.dropped_samples
+            }
+            _ => continue,
+        };
+        for series in table.timeseries {
+            ensure!(
+                series
+                    .points
+                    .values
+                    .first()
+                    .is_some_and(|v| v.metric_type == MetricType::Delta),
+                "Oximeter exception counter was not converted to deltas"
+            );
+            for (start, _, value) in series.integer_points()? {
+                let start = start
+                    .context("Oximeter exception delta omitted start time")?;
+                if let Some(value) = value
+                    && start >= window_start
+                {
+                    ensure!(value >= 0, "Oximeter exception delta is negative");
+                    *target = target.saturating_add(value as u64);
+                }
+            }
+        }
+    }
+    Ok(exceptions)
+}
 
 async fn ssh_capture_bounded(
     ip: &str,
@@ -407,15 +867,53 @@ pub struct Collector<E> {
     executor: Arc<E>,
     targets: CollectorTargets,
     baselines: Arc<Mutex<BTreeMap<ResourceId, ResourceTelemetry>>>,
+    nexus: BTreeMap<RackId, Arc<NexusClient>>,
+    sled_serials: BTreeMap<String, (RackId, String, bool)>,
+    oximeter_attempts: Mutex<BTreeMap<RackId, Instant>>,
+    oximeter_diagnostic_attempts: Mutex<BTreeMap<RackId, Instant>>,
 }
 
 impl<E: NodeExecutor> Collector<E> {
-    pub fn new(executor: Arc<E>, config: &VoxelConfig) -> Self {
-        Self {
+    pub fn new(executor: Arc<E>, config: &VoxelConfig) -> anyhow::Result<Self> {
+        let login = RecoveryLogin::from_config(config);
+        let nexus = if cfg!(test) {
+            BTreeMap::new()
+        } else if let Some(login) = login {
+            (0..config.topology.racks())
+                .map(|rack| {
+                    Ok((
+                        RackId(rack),
+                        Arc::new(NexusClient::for_rack(
+                            config,
+                            rack,
+                            login.clone(),
+                            Duration::from_secs(60),
+                        )?),
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?
+        } else {
+            BTreeMap::new()
+        };
+        let sled_serials = config
+            .sleds()
+            .into_iter()
+            .map(|sled| {
+                (
+                    sled.serial_number,
+                    (RackId(sled.rack), sled.name, sled.scrimlet),
+                )
+            })
+            .collect();
+        Ok(Self {
             executor,
             targets: CollectorTargets::from_config(config),
             baselines: Default::default(),
-        }
+            nexus,
+            sled_serials,
+            oximeter_attempts: Default::default(),
+            oximeter_diagnostic_attempts: Default::default(),
+        })
     }
 
     async fn call(
@@ -489,6 +987,178 @@ impl<E: NodeExecutor> Collector<E> {
         true
     }
 
+    async fn collect_oximeter(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let at = Instant::now();
+        let racks = self
+            .nexus
+            .iter()
+            .map(|(rack, client)| (*rack, Arc::clone(client)))
+            .collect::<Vec<_>>();
+        let concurrency = racks.len().max(1);
+        let jobs = racks.into_iter().map(|(rack, client)| async move {
+            self.collect_oximeter_rack(sender, rack, &client, at, cancel).await
+        });
+        stream::iter(jobs)
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .all(|keep_running| keep_running)
+    }
+
+    async fn collect_oximeter_rack(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        rack: RackId,
+        client: &NexusClient,
+        at: Instant,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let traffic_due = {
+            let attempts = self.oximeter_attempts.lock().await;
+            oximeter_due(&attempts, rack, at)
+        };
+        let diagnostics_due = {
+            let attempts = self.oximeter_diagnostic_attempts.lock().await;
+            oximeter_due(&attempts, rack, at)
+        };
+        if !traffic_due && !diagnostics_due {
+            return true;
+        }
+
+        let readiness =
+            tokio::time::timeout(NEXUS_READY_TIMEOUT, client.ready(cancel))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "Nexus readiness timed out after {:?}",
+                        NEXUS_READY_TIMEOUT
+                    )
+                })
+                .and_then(|result| result);
+        if let Err(error) = readiness {
+            let completed_at = Instant::now();
+            if traffic_due {
+                self.oximeter_attempts.lock().await.insert(rack, completed_at);
+            }
+            if diagnostics_due {
+                self.oximeter_diagnostic_attempts
+                    .lock()
+                    .await
+                    .insert(rack, completed_at);
+            }
+            let message = error.to_string();
+            if !Self::send(
+                sender,
+                cancel,
+                AppEvent::NexusUnavailable {
+                    rack,
+                    at: completed_at,
+                    message: message.clone(),
+                },
+            )
+            .await
+            {
+                return false;
+            }
+            return !traffic_due
+                || Self::send(
+                    sender,
+                    cancel,
+                    AppEvent::OximeterTrafficFailed {
+                        rack,
+                        at: completed_at,
+                        message: format!("Oximeter traffic: {message}"),
+                    },
+                )
+                .await;
+        }
+        if !Self::send(sender, cancel, AppEvent::NexusAvailable { rack, at })
+            .await
+        {
+            return false;
+        }
+
+        let traffic = async {
+            !traffic_due
+                || self
+                    .collect_oximeter_traffic(sender, rack, client, at, cancel)
+                    .await
+        };
+        let diagnostics = async {
+            !diagnostics_due
+                || self
+                    .collect_oximeter_diagnostics(
+                        sender, rack, client, at, cancel,
+                    )
+                    .await
+        };
+        let (traffic, diagnostics) = tokio::join!(traffic, diagnostics);
+        traffic && diagnostics
+    }
+
+    async fn collect_oximeter_traffic(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        rack: RackId,
+        client: &NexusClient,
+        at: Instant,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let result = self.oximeter_traffic(rack, client, at, cancel).await;
+        let completed_at = Instant::now();
+        self.oximeter_attempts.lock().await.insert(rack, completed_at);
+        let events = match result {
+            Ok(samples) => samples
+                .into_iter()
+                .map(|(id, samples)| AppEvent::OximeterTraffic {
+                    id,
+                    at: completed_at,
+                    samples,
+                })
+                .collect(),
+            Err(error) => vec![AppEvent::OximeterTrafficFailed {
+                rack,
+                at: completed_at,
+                message: format!("Oximeter traffic: {error}"),
+            }],
+        };
+        for event in events {
+            if !Self::send(sender, cancel, event).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn oximeter_traffic(
+        &self,
+        rack: RackId,
+        client: &NexusClient,
+        now: Instant,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<BTreeMap<ResourceId, Vec<(Instant, TrafficSample)>>>
+    {
+        let queries = oximeter_traffic_queries(rack, &self.sled_serials);
+        let mut results = Vec::with_capacity(queries.len());
+        // Keeping each response below one sled's data avoids stalled Nexus
+        // streams while retaining link and zone detail.
+        for query in queries {
+            results.push(client.query(&query, cancel).await?);
+        }
+        let result = OxqlQueryResult {
+            tables: results
+                .into_iter()
+                .flat_map(|result| result.tables)
+                .collect(),
+        };
+        parse_oximeter_traffic(result, rack, &self.sled_serials, now)
+    }
+
     async fn traffic_one(
         &self,
         resource: &ResourceTarget,
@@ -521,6 +1191,7 @@ impl<E: NodeExecutor> Collector<E> {
             total: state.total_rate(),
             links: state.link_rates.clone(),
             zones: state.top_zones(usize::MAX),
+            ..Default::default()
         })
     }
 
@@ -558,6 +1229,87 @@ impl<E: NodeExecutor> Collector<E> {
                 return false;
             }
         }
+        true
+    }
+
+    async fn collect_oximeter_diagnostics(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        rack: RackId,
+        client: &NexusClient,
+        at: Instant,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let mut diagnostics =
+            futures::stream::FuturesUnordered::<BoxFuture<'_, AppEvent>>::new();
+        diagnostics.push(Box::pin(async {
+            match client.query(ZONE_CPU_QUERY, cancel).await.and_then(
+                |result| parse_zone_cpu(result, rack, &self.sled_serials),
+            ) {
+                Ok(zones) => AppEvent::ZoneCpu { rack, at, zones },
+                Err(error) => AppEvent::ZoneCpuFailed {
+                    rack,
+                    at,
+                    message: error.to_string(),
+                },
+            }
+        }));
+        diagnostics.push(Box::pin(async {
+            let zfs = async {
+                let (allocated, total) = tokio::join!(
+                    client.query(ZFS_ALLOCATED_QUERY, cancel),
+                    client.query(ZFS_TOTAL_QUERY, cancel),
+                );
+                let mut result = allocated?;
+                result.tables.extend(total?.tables);
+                Ok::<_, anyhow::Error>(result)
+            }
+            .await
+            .and_then(|result| {
+                parse_zfs_headroom(result, rack, &self.sled_serials)
+            });
+            match zfs {
+                Ok(pools) => AppEvent::ZfsHeadroom { rack, at, pools },
+                Err(error) => AppEvent::ZfsHeadroomFailed {
+                    rack,
+                    at,
+                    message: error.to_string(),
+                },
+            }
+        }));
+        diagnostics.push(Box::pin(async {
+            let exceptions = async {
+                let mut tables = Vec::new();
+                for query in oximeter_exception_queries() {
+                    match client.query(&query, cancel).await {
+                        Ok(result) => tables.extend(result.tables),
+                        // Nothing of this kind has been counted yet.
+                        Err(error) if error.is::<MissingTimeseries>() => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                parse_oximeter_exceptions(OxqlQueryResult { tables })
+            };
+            match exceptions.await {
+                Ok(exceptions) => {
+                    AppEvent::OximeterExceptions { rack, at, exceptions }
+                }
+                Err(error) => AppEvent::OximeterExceptionsFailed {
+                    rack,
+                    at,
+                    message: error.to_string(),
+                },
+            }
+        }));
+        while let Some(event) = diagnostics.next().await {
+            if !Self::send(sender, cancel, event).await {
+                return false;
+            }
+        }
+        self.oximeter_diagnostic_attempts
+            .lock()
+            .await
+            .insert(rack, Instant::now());
         true
     }
 
@@ -685,49 +1437,69 @@ impl<E: NodeExecutor> Collector<E> {
         cancel: CancellationToken,
         gate: Arc<tokio::sync::Semaphore>,
     ) {
-        let now = tokio::time::Instant::now();
-        let mut traffic_due = now;
-        let mut health_due = now;
-        loop {
-            let next_due = traffic_due.min(health_due);
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep_until(next_due) => {},
+        let probes = async {
+            let now = tokio::time::Instant::now();
+            let mut traffic_due = now;
+            let mut health_due = now;
+            loop {
+                let next_due = traffic_due.min(health_due);
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep_until(next_due) => {},
+                }
+                let permit = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    permit = gate.clone().acquire_owned() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    },
+                };
+                let health_cadence = health_due < traffic_due;
+                let keep_running = if health_cadence {
+                    self.collect_health_with_limit(
+                        &sender,
+                        &cancel,
+                        config.concurrency,
+                    )
+                    .await
+                } else {
+                    self.collect_traffic_with_limit(
+                        &sender,
+                        &cancel,
+                        config.concurrency,
+                    )
+                    .await
+                };
+                let completed = tokio::time::Instant::now();
+                if health_cadence {
+                    health_due = completed + config.health_interval;
+                } else {
+                    traffic_due = completed + config.traffic_interval;
+                }
+                drop(permit);
+                if !keep_running {
+                    break;
+                }
             }
-            let permit = tokio::select! {
-                _ = cancel.cancelled() => break,
-                permit = gate.clone().acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
-            };
-            let health_cadence = health_due < traffic_due;
-            let keep_running = if health_cadence {
-                self.collect_health_with_limit(
-                    &sender,
-                    &cancel,
-                    config.concurrency,
-                )
-                .await
-            } else {
-                self.collect_traffic_with_limit(
-                    &sender,
-                    &cancel,
-                    config.concurrency,
-                )
-                .await
-            };
-            let completed = tokio::time::Instant::now();
-            if health_cadence {
-                health_due = completed + config.health_interval;
-            } else {
-                traffic_due = completed + config.traffic_interval;
+        };
+        let oximeter = async {
+            let mut interval = tokio::time::interval(config.traffic_interval);
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {},
+                }
+                if sender.is_closed()
+                    || !self.collect_oximeter(&sender, &cancel).await
+                {
+                    break;
+                }
             }
-            drop(permit);
-            if !keep_running {
-                break;
-            }
-        }
+        };
+        tokio::join!(probes, oximeter);
     }
 }
 
@@ -736,10 +1508,16 @@ mod tests {
     use super::*;
     use crate::tui::app::App;
     use crate::tui::reconcile::ObservedDeploymentState;
-    use crate::tui::telemetry::{BidirectionalRate, HealthState};
-    use crate::tui::test_support::config;
+    use crate::tui::telemetry::HealthState;
+    use crate::tui::test_support::{config, recovery};
     use crate::tui::ui::monitor::resource_health_state;
+    use httptest::matchers::any;
+    use httptest::responders::{delay_and_then, status_code};
+    use httptest::{Expectation, Server};
     use indoc::indoc;
+    use oxide_client::types::{
+        FieldValue, OxqlTable, Points, Timeseries, ValueArray, Values,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// How long a step may take before it counts as hung. Only a failing
@@ -839,6 +1617,15 @@ mod tests {
         }
     }
 
+    /// A Nexus client pointed at a test server.
+    fn nexus(server: &Server, timeout: Duration) -> Arc<NexusClient> {
+        let endpoint = reqwest::Url::parse(&server.url_str("/")).unwrap();
+        Arc::new(
+            NexusClient::new(vec![endpoint], None, recovery(), timeout)
+                .unwrap(),
+        )
+    }
+
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         tokio::time::timeout(HANG, async {
             while !condition() {
@@ -849,7 +1636,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("{what}: not reached within {HANG:?}"));
     }
 
-    /// A collector over explicit targets.
+    /// A collector over explicit targets, with no Nexus and no serials.
     fn collector(
         executor: Arc<FakeExecutor>,
         resources: Vec<ResourceTarget>,
@@ -858,6 +1645,10 @@ mod tests {
             executor,
             targets: CollectorTargets { resources, rss: vec![] },
             baselines: Default::default(),
+            nexus: Default::default(),
+            sled_serials: Default::default(),
+            oximeter_attempts: Default::default(),
+            oximeter_diagnostic_attempts: Default::default(),
         }
     }
 
@@ -973,7 +1764,7 @@ mod tests {
         }
 
         let fake = fake(vec![(Some("cr1"), LINUX_COUNTERS, Reply::Output(""))]);
-        let collector = Collector::new(fake.clone(), &fleet);
+        let collector = Collector::new(fake.clone(), &fleet).unwrap();
         let cr1 = ResourceId::fleet(ResourceKind::Router, "cr1");
         let (sender, mut receiver) = mpsc::channel(64);
         let cancel = CancellationToken::new();
@@ -1084,7 +1875,7 @@ mod tests {
             (Some("g3"), MAINTENANCE_SERVICES, broken),
             (Some("g2"), RSS_PROBE, Reply::Fail("unreachable")),
         ]);
-        let collector = Collector::new(fake, &config);
+        let collector = Collector::new(fake, &config).unwrap();
         let (sender, mut receiver) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
@@ -1255,23 +2046,74 @@ mod tests {
         );
     }
 
-    /// The scheduler keeps its concurrency limit and never runs the traffic
-    /// and health cadences at once, yet slow probes hold up neither cadence.
+    /// Oximeter is asked at most once per interval per rack, and not at all
+    /// past an unavailable Nexus. The scheduler keeps its concurrency limit
+    /// and never runs the traffic and health cadences at once, yet slow
+    /// probes and a stalled Nexus hold up neither cadence.
     #[tokio::test]
-    async fn slow_probes_do_not_block_either_cadence() {
+    async fn slow_or_failed_sources_do_not_block_the_others() {
+        let start = Instant::now();
+        let asked = BTreeMap::from([(RackId(0), start)]);
+        let almost = start + OXIMETER_INTERVAL - Duration::from_nanos(1);
+        assert_eq!(
+            [
+                oximeter_due(&BTreeMap::new(), RackId(0), start),
+                oximeter_due(&asked, RackId(0), almost),
+                oximeter_due(&asked, RackId(0), start + OXIMETER_INTERVAL),
+                oximeter_due(&asked, RackId(1), start),
+            ],
+            [true, false, true, true],
+            "Oximeter due: never asked, within the interval, after it, \
+             another rack"
+        );
+
         let config = config(indoc! {r#"
             [topology]
             racks = 2
             sleds = 2
             routers = ["ce"]
         "#});
+
+        // Exactly one request: the readiness check, and no query after it.
+        let mut unavailable = Server::run();
+        unavailable.expect(
+            Expectation::matching(any()).respond_with(status_code(503)),
+        );
+        let collector = Collector {
+            nexus: BTreeMap::from([(
+                RackId(0),
+                nexus(&unavailable, Duration::from_secs(1)),
+            )]),
+            ..Collector::new(fake(vec![]), &config).unwrap()
+        };
+        let (sender, mut receiver) = mpsc::channel(16);
+        assert!(
+            collector
+                .collect_oximeter(&sender, &CancellationToken::new())
+                .await
+        );
+        let events: Vec<_> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                events[..],
+                [
+                    AppEvent::NexusUnavailable { rack: RackId(0), .. },
+                    AppEvent::OximeterTrafficFailed { rack: RackId(0), .. },
+                ]
+            ),
+            "unavailable Nexus: {events:?}"
+        );
+        unavailable.verify_and_clear();
+
         let gate = || Arc::new(tokio::sync::Semaphore::new(1));
 
         let held = fake(vec![
             (None, KSTAT, Reply::Held),
             (None, LINUX_COUNTERS, Reply::Held),
         ]);
-        let collector = Arc::new(Collector::new(held.clone(), &config));
+        let collector =
+            Arc::new(Collector::new(held.clone(), &config).unwrap());
         let hour = Duration::from_secs(3_600);
         let (sender, _receiver) = mpsc::channel(64);
         let cancel = CancellationToken::new();
@@ -1292,12 +2134,25 @@ mod tests {
         cancel.cancel();
 
         // Traffic probes outlast the traffic interval, so traffic is always
-        // due.
-        let slow = Reply::Delay(Duration::from_millis(20));
-        let collector = Arc::new(Collector::new(
-            fake(vec![(None, KSTAT, slow), (None, LINUX_COUNTERS, slow)]),
-            &config,
+        // due, and rack 0's Nexus never answers.
+        let stalled = Server::run();
+        stalled.expect(Expectation::matching(any()).times(..).respond_with(
+            delay_and_then(Duration::from_secs(3_600), status_code(200)),
         ));
+        let slow = Reply::Delay(Duration::from_millis(20));
+        let collector = Arc::new(Collector {
+            // Longer than HANG, so a stall that blocked direct probes would
+            // outlast it.
+            nexus: BTreeMap::from([(
+                RackId(0),
+                nexus(&stalled, Duration::from_secs(60)),
+            )]),
+            ..Collector::new(
+                fake(vec![(None, KSTAT, slow), (None, LINUX_COUNTERS, slow)]),
+                &config,
+            )
+            .unwrap()
+        });
         let (sender, mut receiver) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(
@@ -1313,6 +2168,8 @@ mod tests {
                 gate(),
             ),
         );
+        // HANG is shorter than NEXUS_READY_TIMEOUT, so a cadence blocked
+        // behind the stalled readiness check cannot meet it.
         let mut traffic_rounds = BTreeSet::new();
         let mut health_round = false;
         let _ = tokio::time::timeout(HANG, async {
@@ -1328,12 +2185,304 @@ mod tests {
             }
         })
         .await;
-        assert!(traffic_rounds.len() >= 3, "direct traffic lost its cadence");
+        assert!(
+            traffic_rounds.len() >= 3,
+            "direct traffic lost its cadence while Nexus stalls"
+        );
         assert!(health_round, "health starved while traffic is always due");
         cancel.cancel();
         assert!(
             tokio::time::timeout(HANG, task).await.is_ok_and(|r| r.is_ok()),
             "the scheduler did not stop when cancelled"
+        );
+    }
+
+    // OxQL responses are built from the client's generated types, so a change
+    // to the response schema at the pinned omicron rev breaks them at compile
+    // time.
+
+    fn string(value: &str) -> FieldValue {
+        FieldValue::String(value.into())
+    }
+
+    fn points(
+        start_times: Option<&[&str]>,
+        timestamps: &[&str],
+        metric_type: MetricType,
+        values: ValueArray,
+    ) -> Points {
+        let at =
+            |times: &[&str]| times.iter().map(|t| t.parse().unwrap()).collect();
+        Points {
+            start_times: start_times.map(at),
+            timestamps: at(timestamps),
+            values: vec![Values { metric_type, values }],
+        }
+    }
+
+    fn series(fields: &[(&str, FieldValue)], points: Points) -> Timeseries {
+        Timeseries {
+            fields: fields
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+            points,
+        }
+    }
+
+    fn table(name: &str, timeseries: Vec<Timeseries>) -> OxqlTable {
+        OxqlTable { name: name.into(), timeseries }
+    }
+
+    /// One delta per traffic metric for sled 2FAKE000, valued by position,
+    /// each starting at 00:00:00 and ending a second later than the one
+    /// before, from 00:00:10; `null_table` reports a missing sample instead.
+    fn traffic_result(null_table: Option<&str>) -> OxqlQueryResult {
+        let tables = OXIMETER_TRAFFIC_METRICS
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let value =
+                    (null_table != Some(name)).then_some((index + 1) as i64);
+                let end = format!("2026-08-17T00:00:{}Z", 10 + index);
+                table(
+                    name,
+                    vec![series(
+                        &[
+                            ("sled_serial", string("2FAKE000")),
+                            ("zone_name", string("oxz_nexus_deadbeef0")),
+                            ("link_name", string("net0")),
+                        ],
+                        points(
+                            Some(&["2026-08-17T00:00:00Z"]),
+                            &[end.as_str()],
+                            MetricType::Delta,
+                            ValueArray::Integer(vec![value]),
+                        ),
+                    )],
+                )
+            })
+            .collect();
+        OxqlQueryResult { tables }
+    }
+
+    /// Every OxQL query the collector sends, as text, so a query edit shows up
+    /// as a reviewed diff. Regenerate with `EXPECTORATE=overwrite`.
+    #[test]
+    fn oxql_queries_match_their_golden_file() {
+        let serials = BTreeMap::from([
+            ("2FAKE000".into(), (RackId(0), "g0".into(), true)),
+            ("2FAKE001".into(), (RackId(0), "g1".into(), false)),
+        ]);
+        let mut text = String::from(
+            "# traffic, rack 0 with sleds 2FAKE000 and 2FAKE001\n",
+        );
+        for query in oximeter_traffic_queries(RackId(0), &serials) {
+            text.push_str(&query);
+            text.push('\n');
+        }
+        let [failed, dropped] = oximeter_exception_queries();
+        for (label, query) in [
+            ("zone CPU", ZONE_CPU_QUERY),
+            ("ZFS allocated", ZFS_ALLOCATED_QUERY),
+            ("ZFS total", ZFS_TOTAL_QUERY),
+            ("oximeter failed collections", failed.as_str()),
+            ("oximeter dropped samples", dropped.as_str()),
+        ] {
+            text.push_str(&format!("\n# {label}\n{query}\n"));
+        }
+        expectorate::assert_contents("tests/output/oxql-queries.txt", &text);
+    }
+
+    /// Traffic queries stay one sled per response, and each kind of Oximeter
+    /// response parses into the samples the monitor shows, rejecting a
+    /// partial one.
+    #[test]
+    fn oximeter_responses_parse_into_samples() {
+        let serials = BTreeMap::from([
+            ("2FAKE000".into(), (RackId(0), "g0".into(), true)),
+            ("2FAKE\"001".into(), (RackId(0), "g1".into(), false)),
+            ("2FAKE002".into(), (RackId(1), "g2".into(), false)),
+        ]);
+        let queries = oximeter_traffic_queries(RackId(0), &serials);
+        let filters: BTreeSet<_> = queries
+            .iter()
+            .filter_map(|query| query.split(" | ").nth(1))
+            .collect();
+        assert_eq!(
+            filters,
+            BTreeSet::from([
+                r#"filter sled_serial == "2FAKE000""#,
+                r#"filter sled_serial == "2FAKE\"001""#,
+            ]),
+            "traffic queries are each filtered to one of rack 0's sleds"
+        );
+
+        let g0 = ResourceId::rack(RackId(0), ResourceKind::Sled, "g0");
+        let zone = "oxz_nexus_deadbeef0";
+        let parse_traffic = |null_table| {
+            parse_oximeter_traffic(
+                traffic_result(null_table),
+                RackId(0),
+                &serials,
+                Instant::now(),
+            )
+        };
+        let samples: Vec<_> = parse_traffic(None)
+            .expect("a complete traffic response parses")
+            .into_iter()
+            .flat_map(|(id, samples)| {
+                samples.into_iter().map(move |(_, sample)| (id.clone(), sample))
+            })
+            .collect();
+        // Each metric's delta is its position over its own interval, and the
+        // metrics' different timestamps still make one sample.
+        let rate = BidirectionalRate {
+            rx_bytes_sec: 1.0 / 10.0,
+            tx_bytes_sec: 2.0 / 11.0,
+            rx_packets_sec: 3.0 / 12.0,
+            tx_packets_sec: 4.0 / 13.0,
+        };
+        let errors =
+            BidirectionalErrors { rx_sec: 5.0 / 14.0, tx_sec: 6.0 / 15.0 };
+        let sample = TrafficSample {
+            total: rate,
+            links: BTreeMap::from([(format!("{zone}/net0"), rate)]),
+            zones: vec![ZoneTraffic {
+                name: zone.into(),
+                short_name: "nexus".into(),
+                rate,
+                errors,
+            }],
+            errors,
+            source: TrafficSource::Oximeter,
+        };
+        assert_eq!(samples, [(g0.clone(), sample)]);
+        assert!(
+            parse_traffic(Some("sled_data_link:bytes_sent")).is_err(),
+            "a null metric must reject the partial sample"
+        );
+
+        // Each shape's latest point is two seconds of CPU in a ten-second
+        // window, so every state reads 20%.
+        let delta_pair = points(
+            Some(&["2026-08-17T00:00:00Z", "2026-08-17T00:00:10Z"]),
+            &["2026-08-17T00:00:10Z", "2026-08-17T00:00:20Z"],
+            MetricType::Delta,
+            ValueArray::Integer(vec![Some(1_000_000_000), Some(2_000_000_000)]),
+        );
+        let aligned_gauge = points(
+            None,
+            &["2026-08-17T00:00:10Z"],
+            MetricType::Gauge,
+            ValueArray::Double(vec![Some(2_000_000_000.0)]),
+        );
+        let cpu = ZoneCpu {
+            id: g0.clone(),
+            name: zone.into(),
+            kind: "nexus".into(),
+            user_percent: 20.0,
+            system_percent: 20.0,
+            wait_percent: 20.0,
+        };
+        for (case, points) in
+            [("delta pair", delta_pair), ("aligned gauge", aligned_gauge)]
+        {
+            let timeseries = ["user", "sys", "waitrq"]
+                .into_iter()
+                .map(|state| {
+                    series(
+                        &[
+                            ("sled_serial", string("2FAKE000")),
+                            ("zone_name", string(zone)),
+                            ("zone_type", string("nexus")),
+                            ("state", string(state)),
+                        ],
+                        points.clone(),
+                    )
+                })
+                .collect();
+            let parsed = parse_zone_cpu(
+                OxqlQueryResult {
+                    tables: vec![table("zone:cpu_nsec", timeseries)],
+                },
+                RackId(0),
+                &serials,
+            )
+            .unwrap_or_else(|error| panic!("zone CPU, {case}: {error:#}"));
+            assert_eq!(parsed, std::slice::from_ref(&cpu), "zone CPU, {case}");
+        }
+
+        let tables =
+            [("zfs_pool:bytes_allocated", 40), ("zfs_pool:bytes_total", 100)]
+                .into_iter()
+                .map(|(name, value)| {
+                    table(
+                        name,
+                        vec![series(
+                            &[
+                                ("sled_serial", string("2FAKE000")),
+                                ("pool_name", string("oxp_test")),
+                            ],
+                            points(
+                                None,
+                                &["2026-08-17T00:00:10Z"],
+                                MetricType::Gauge,
+                                ValueArray::Integer(vec![Some(value)]),
+                            ),
+                        )],
+                    )
+                })
+                .collect();
+        let zfs =
+            parse_zfs_headroom(OxqlQueryResult { tables }, RackId(0), &serials)
+                .expect("ZFS allocated and total gauges parse");
+        assert_eq!(
+            zfs,
+            [ZfsHeadroom {
+                id: g0,
+                pool: "oxp_test".into(),
+                allocated_bytes: 40,
+                total_bytes: 100,
+            }]
+        );
+
+        // The failure counter has run for an hour, so its first delta in the
+        // window carries the 20 failures before it; only the 2 after count.
+        // The dropped-sample counter started within the window, so all of its
+        // 3 count.
+        let exceptions = |name, start_times: &[&str], timestamps, values| {
+            table(
+                name,
+                vec![series(
+                    &[("collector_port", FieldValue::U16(12223))],
+                    points(
+                        Some(start_times),
+                        timestamps,
+                        MetricType::Delta,
+                        ValueArray::Integer(values),
+                    ),
+                )],
+            )
+        };
+        let tables = vec![
+            exceptions(
+                "oximeter_collector:failed_collections",
+                &["2026-08-16T23:00:00Z", "2026-08-17T00:00:10Z"],
+                &["2026-08-17T00:00:10Z", "2026-08-17T00:00:20Z"],
+                vec![Some(20), Some(2)],
+            ),
+            exceptions(
+                "oximeter_collector:database_samples_dropped",
+                &["2026-08-17T00:00:00Z"],
+                &["2026-08-17T00:00:10Z"],
+                vec![Some(3)],
+            ),
+        ];
+        assert_eq!(
+            parse_oximeter_exceptions(OxqlQueryResult { tables })
+                .expect("Oximeter exception deltas parse"),
+            OximeterExceptions { failed_collections: 2, dropped_samples: 3 }
         );
     }
 }
