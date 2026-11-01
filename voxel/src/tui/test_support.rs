@@ -10,6 +10,12 @@
 
 use crossterm::event::KeyCode;
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer};
+use voxel_config::VoxelConfig;
+
+/// Parse a `voxel.toml` snippet, written as a user would write it.
+pub(crate) fn config(toml: &str) -> VoxelConfig {
+    VoxelConfig::from_toml(toml).expect("test config parses")
+}
 
 /// The keys a footer or help label names, such as `"↑/↓"` or
 /// `"PgUp / PgDn"`. An unknown label panics, so a new label cannot slip past

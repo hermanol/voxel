@@ -2,11 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The root layout and shared widgets: the overlay area, the action guidance
-//! bar, and the theme's styles and blocks.
+//! The root layout and shared widgets: section sizing, the overlay area, the
+//! action guidance bar, width-aware text fitting, and the theme's styles and
+//! blocks.
 
 use super::{
     colors::*,
+    deployment,
     renderer::{LayoutMode, MIN_HEIGHT, MIN_WIDTH, layout_mode},
 };
 use crate::tui::app::App;
@@ -16,6 +18,33 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
+
+pub(crate) fn terminal_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+pub(crate) fn fit_terminal_width(text: &str, width: usize) -> String {
+    if terminal_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let content_width = width - 1;
+    let mut fitted = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let character_width = terminal_width(&character.to_string());
+        if used + character_width > content_width {
+            break;
+        }
+        fitted.push(character);
+        used += character_width;
+    }
+    fitted.push('…');
+    fitted
+}
 
 pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     // Like wicket, paint the theme's background rather than the terminal's.
@@ -31,13 +60,32 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         minimum(frame, area);
         return;
     }
+    let alerts = app.operation.retained_warnings.len()
+        + usize::from(app.operation.start_failure.is_some())
+        + usize::from(app.deployment.reconciliation_failure.is_some());
+    let state = format!("{:?} │ alerts {alerts}", app.deployment.observed);
+    let header =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(32)])
+            .split(root.header);
     frame.render_widget(
         Block::default()
             .borders(Borders::BOTTOM)
             .title(" VOXEL ")
             .border_style(line_style(true)),
-        root.header,
+        header[0],
     );
+    frame.render_widget(
+        Paragraph::new(state)
+            .style(Style::default().fg(OX_OFF_WHITE))
+            .right_aligned()
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(line_style(true)),
+            ),
+        header[1],
+    );
+    deployment::draw(frame, root.content, app, root.mode);
     frame.render_widget(
         Paragraph::new(guidance_lines(app, root.footer.width)),
         root.footer,
@@ -48,6 +96,17 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     if app.session.confirmation.is_some() {
         super::confirm_dialog::draw(frame, app);
     }
+}
+
+pub(crate) fn content_area(app: &App) -> (Rect, LayoutMode) {
+    let terminal = Rect::new(
+        0,
+        0,
+        app.session.terminal.width,
+        app.session.terminal.height,
+    );
+    let root = root_layout(terminal);
+    (root.content, root.mode)
 }
 
 pub(crate) fn overlay_area(area: Rect) -> Rect {
@@ -87,6 +146,65 @@ fn root_layout(area: Rect) -> RootLayout {
     RootLayout { header: rows[0], content: rows[1], footer: rows[2], mode }
 }
 
+fn grow_section(
+    heights: &mut [u16],
+    index: usize,
+    preferred: &[u16],
+    remaining: &mut u16,
+) {
+    if index >= heights.len() || index >= preferred.len() || *remaining == 0 {
+        return;
+    }
+    let wanted = preferred[index].saturating_sub(heights[index]);
+    let granted = wanted.min(*remaining);
+    heights[index] = heights[index].saturating_add(granted);
+    *remaining = remaining.saturating_sub(granted);
+}
+
+pub(crate) fn section_heights(
+    total: u16,
+    expanded: &[bool],
+    focused: usize,
+    preferred: &[u16],
+    priority: &[usize],
+    flexible: usize,
+) -> Vec<u16> {
+    let count = expanded.len().min(preferred.len());
+    let mut heights = vec![0; count];
+    for height in heights.iter_mut().take(total as usize) {
+        *height = 1;
+    }
+    let mut remaining = total.saturating_sub(count as u16);
+    if expanded.get(focused).copied().unwrap_or(false) {
+        grow_section(&mut heights, focused, preferred, &mut remaining);
+    }
+    for &index in priority {
+        if expanded.get(index).copied().unwrap_or(false) && index != focused {
+            grow_section(&mut heights, index, preferred, &mut remaining);
+        }
+    }
+    if expanded.get(flexible).copied().unwrap_or(false)
+        && flexible < heights.len()
+    {
+        heights[flexible] = heights[flexible].saturating_add(remaining);
+    }
+    heights
+}
+
+pub(crate) fn section_rects(area: Rect, heights: &[u16]) -> Vec<Rect> {
+    let mut y = area.y;
+    heights
+        .iter()
+        .map(|height| {
+            let available = area.bottom().saturating_sub(y);
+            let height = (*height).min(available);
+            let rect = Rect::new(area.x, y, area.width, height);
+            y = y.saturating_add(height);
+            rect
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct ActionGroup {
     key: &'static str,
@@ -94,7 +212,7 @@ struct ActionGroup {
 }
 
 fn guidance_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let groups = action_groups(app);
+    let groups = action_groups(app, width < 80);
     let row_count = if width >= 160 {
         1
     } else if width >= 100 {
@@ -134,9 +252,15 @@ fn styled_groups(groups: Vec<ActionGroup>) -> Line<'static> {
     Line::from(spans)
 }
 
-fn action_groups(app: &App) -> Vec<ActionGroup> {
+fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     let group = |key, description| ActionGroup { key, description };
-    let lifecycle = || vec![group("q", "quit")];
+    let lifecycle = || {
+        vec![group(
+            "q",
+            if app.resources_may_exist() { "destroy+quit" } else { "quit" },
+        )]
+    };
+    let contextual_navigation = if narrow { "Tab/⇧" } else { "Tab/S-Tab" };
     if app.session.confirmation.is_some() {
         return vec![
             group("↑/↓", "move"),
@@ -149,7 +273,40 @@ fn action_groups(app: &App) -> Vec<ActionGroup> {
         groups.extend(lifecycle());
         return groups;
     }
-    let mut groups = lifecycle();
+    let mut groups = Vec::new();
+    if app.can_cancel() {
+        groups.push(group("x", if narrow { "" } else { "destroy" }));
+    } else {
+        for (kind, key, description) in [
+            (crate::tui::operation::OperationKind::Launch, "l", "launch"),
+            (crate::tui::operation::OperationKind::Route, "r", "route"),
+        ] {
+            if app.can_start(kind) {
+                groups.push(group(key, if narrow { "" } else { description }));
+            }
+        }
+    }
+    let pane = app.session.deployment_pane;
+    let expanded = app.session.deployment_expanded(pane);
+    groups.push(group("Space", if expanded { "fold" } else { "expand" }));
+    if expanded {
+        match pane {
+            crate::tui::event::DeploymentPane::Phases => {
+                groups.push(group("↑/↓", "item"));
+                groups.push(group("Pg", if narrow { "" } else { "page" }));
+            }
+            crate::tui::event::DeploymentPane::Logs => {
+                groups.push(group("f", "filter"));
+                groups.push(group("↑/↓", "log"));
+                groups.push(group("Pg", if narrow { "" } else { "page" }));
+            }
+            crate::tui::event::DeploymentPane::OverallProgress
+            | crate::tui::event::DeploymentPane::Status
+            | crate::tui::event::DeploymentPane::CurrentPhase => {}
+        }
+    }
+    groups.push(group(contextual_navigation, "section"));
+    groups.extend(lifecycle());
     groups.push(group("?", "help"));
     groups
 }
@@ -213,46 +370,97 @@ pub(crate) fn primary_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
     rounded_block().title(title).border_style(line_style(true))
 }
 
+pub(crate) fn section_block<'a>(
+    title: impl Into<Line<'a>>,
+    expanded: bool,
+    focused: bool,
+) -> Block<'a> {
+    let mut spans = vec![Span::raw(if expanded { " ▾ " } else { " ▸ " })];
+    spans.extend(title.into().spans);
+    rounded_block()
+        .title(Line::from(spans))
+        .border_style(line_style(focused))
+        .title_style(header_style(focused))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::{
-        event::Confirmation, terminal::key_action, test_support::key_codes,
+        app::ActiveOperation,
+        event::{Confirmation, DeploymentPane, OperationRequestId},
+        operation::OperationKind,
+        reconcile::ObservedDeploymentState,
+        terminal::key_action,
+        test_support::key_codes,
     };
     use crossterm::event::{KeyEvent, KeyModifiers};
 
-    /// Every key a footer advertises reaches an action, and each state keeps
-    /// the group users find their way by. A retired or mistyped key fails the
-    /// first check.
+    /// Every key a footer advertises, at either width, reaches an action, and
+    /// each state keeps the group users find their way by. A retired or
+    /// mistyped key fails the first check, so only bound keys that do nothing
+    /// in a state need to be named as hidden.
     #[test]
     fn footer_advertises_only_keys_that_act() {
         let app = |setup: &dyn Fn(&mut App)| {
-            let mut app = App::new();
+            let mut app = App::new(8);
             setup(&mut app);
             app
         };
-        // (case, app, group shown)
-        let cases: [(&str, App, &str); 3] = [
-            ("idle", app(&|_| {}), "q quit"),
-            ("help", app(&|app| app.session.help_open = true), "?/Esc close"),
+        // (case, app, group shown, group prefix not shown)
+        let cases: [(&str, App, &str, Option<&str>); 5] = [
+            (
+                "deployment idle",
+                app(&|app| {
+                    app.deployment.observed = ObservedDeploymentState::Stopped
+                }),
+                "l launch",
+                Some("↑/↓ "),
+            ),
+            (
+                "deployment logs",
+                app(&|app| app.session.deployment_pane = DeploymentPane::Logs),
+                "f filter",
+                None,
+            ),
+            (
+                "operation running",
+                app(&|app| {
+                    app.operation.active = Some(ActiveOperation::new(
+                        OperationRequestId::FIRST,
+                        OperationKind::Launch,
+                    ))
+                }),
+                "x destroy",
+                None,
+            ),
+            (
+                "help",
+                app(&|app| app.session.help_open = true),
+                "?/Esc close",
+                None,
+            ),
             (
                 "confirmation",
                 app(&|app| app.session.confirmation = Some(Confirmation::Quit)),
                 "Enter select",
+                None,
             ),
         ];
-        for (case, app, shown) in cases {
-            for group in action_groups(&app) {
-                for code in key_codes(group.key) {
-                    assert!(
-                        key_action(KeyEvent::new(code, KeyModifiers::NONE))
-                            .is_some(),
-                        "{case}: footer advertises {:?}, which no key binds",
-                        group.key
-                    );
+        for (case, app, shown, hidden) in cases {
+            for narrow in [false, true] {
+                for group in action_groups(&app, narrow) {
+                    for code in key_codes(group.key) {
+                        assert!(
+                            key_action(KeyEvent::new(code, KeyModifiers::NONE))
+                                .is_some(),
+                            "{case}: footer advertises {:?}, which no key binds",
+                            group.key
+                        );
+                    }
                 }
             }
-            let groups = action_groups(&app)
+            let groups = action_groups(&app, false)
                 .into_iter()
                 .map(|group| format!("{} {}", group.key, group.description))
                 .collect::<Vec<_>>();
@@ -260,6 +468,12 @@ mod tests {
                 groups.iter().any(|group| group == shown),
                 "{case}: footer lacks {shown:?} in {groups:?}"
             );
+            if let Some(prefix) = hidden {
+                assert!(
+                    !groups.iter().any(|group| group.starts_with(prefix)),
+                    "{case}: footer shows {prefix:?} in {groups:?}"
+                );
+            }
         }
     }
 }

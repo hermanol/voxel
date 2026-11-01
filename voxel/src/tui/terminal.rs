@@ -53,15 +53,22 @@ pub fn key_action(key: KeyEvent) -> Option<Action> {
         return None;
     }
     Some(match key.code {
+        KeyCode::Tab => Action::NextSection,
+        KeyCode::BackTab => Action::PreviousSection,
         KeyCode::Enter => Action::Activate,
+        KeyCode::Char(' ') => Action::ToggleSection,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Up => Action::Scroll { delta: -1, page: false },
         KeyCode::Down => Action::Scroll { delta: 1, page: false },
         KeyCode::PageUp => Action::Scroll { delta: -1, page: true },
         KeyCode::PageDown => Action::Scroll { delta: 1, page: true },
+        KeyCode::Char('f') => Action::CycleLogFilter,
         KeyCode::Esc => Action::Close,
         KeyCode::Char('n') => Action::Reject,
+        KeyCode::Char('l') => Action::RequestLaunch,
+        KeyCode::Char('r') => Action::RequestRoute,
         KeyCode::Char('q') => Action::RequestQuit,
+        KeyCode::Char('x') => Action::RequestCancelAndDestroy,
         _ => return None,
     })
 }
@@ -391,15 +398,22 @@ mod tests {
     #[test]
     fn every_documented_key_maps_and_nothing_else_acts() {
         let cases = [
+            (KeyCode::Tab, Some(Action::NextSection)),
+            (KeyCode::BackTab, Some(Action::PreviousSection)),
             (KeyCode::Enter, Some(Action::Activate)),
+            (KeyCode::Char(' '), Some(Action::ToggleSection)),
             (KeyCode::Char('?'), Some(Action::ToggleHelp)),
             (KeyCode::Esc, Some(Action::Close)),
+            (KeyCode::Char('l'), Some(Action::RequestLaunch)),
+            (KeyCode::Char('r'), Some(Action::RequestRoute)),
             (KeyCode::Char('q'), Some(Action::RequestQuit)),
+            (KeyCode::Char('x'), Some(Action::RequestCancelAndDestroy)),
             (KeyCode::Char('n'), Some(Action::Reject)),
             (KeyCode::Up, Some(Action::Scroll { delta: -1, page: false })),
             (KeyCode::Down, Some(Action::Scroll { delta: 1, page: false })),
             (KeyCode::PageUp, Some(Action::Scroll { delta: -1, page: true })),
             (KeyCode::PageDown, Some(Action::Scroll { delta: 1, page: true })),
+            (KeyCode::Char('f'), Some(Action::CycleLogFilter)),
             // A retired numeric view key.
             (KeyCode::Char('1'), None),
         ];

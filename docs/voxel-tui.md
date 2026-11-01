@@ -1,7 +1,10 @@
 # Voxel TUI operator guide
 
 `voxel tui` is the private, persistent control and observability interface for
-a Voxel deployment.
+a Voxel deployment. The TUI supervises the public `voxel launch`, `voxel
+route`, and `voxel destroy` commands as opaque child processes. Its displayed
+phase transitions are advisory hints parsed from output, not lifecycle APIs or
+proof of deployment state. It tracks deployment state through live probes.
 
 ## Usage
 
@@ -16,24 +19,66 @@ $ pfexec ./target/debug/voxel tui
 The TUI is the `voxel` crate's opt-in `tui` feature; a build without it has no
 `voxel tui` subcommand.
 
-Logs are written to `<resolved workdir>/voxel-tui.log`.
+Logs are written to `<resolved workdir>/voxel-tui.log` and displayed in a
+bounded on-screen history. The TUI can launch and destroy Voxel deployments.
+
+### External network
+
+Before a fresh deployment, the TUI defaults the external network to Voxel's
+isolated segment (see [Isolated external
+network](../README.md#isolated-external-network-optional)). If the config sets
+no `external.mode`, the TUI writes `external.mode = "isolated"` to it, takes an
+unset `external.uplink` from the host's default-route link, and records the
+decision in `voxel-tui.log`. In LAN mode, each node leases addresses from the
+LAN's DHCP server. When that subnet is not on-link for the host, the host route
+to the rack cannot be installed, and Nexus and its Oximeter telemetry are
+unreachable. The isolated segment puts `ce` on a host-attached subnet, so the
+route always installs.
+
+An explicit `external.mode`, including `"lan"`, is left alone, and a running
+deployment keeps the mode it was launched with. To keep LAN behavior:
+
+```console
+$ voxel config set external.mode lan
+```
 
 ## Views and actions
 
+The Deployment view has a number of foldable sections stacked within it. `Up`
+and `Down` move within the focused section. `Tab` and `Shift-Tab` move section
+focus, and `Space` folds or expands the focused section.
+
 | Key | Action |
 |---|---|
-| `Up` / `Down` | Scroll Help or move between confirmation options |
-| `PageUp` / `PageDown` | Page Help |
+| `Tab` / `Shift-Tab` | Next / previous top-level section |
+| `Space` | Fold / expand the focused section |
+| `Up` / `Down` | Navigate within the focused section |
+| `PageUp` / `PageDown` | Page nested content without changing section focus |
 | `Enter` | Select the highlighted confirmation option |
 | `?` | Open or close Help |
 | `Esc` | Dismiss the topmost confirmation or Help |
+| `f` | Cycle the level filter while Deployment Logs is focused |
+| `l` / `r` | Request launch / route |
+| `x` | Stop the operation and destroy the deployment; press again to force stop a command that will not settle |
 | `n` | Reject a confirmation |
-| `q` | Quit the TUI |
+| `q` | Quit and destroy the deployment, unless it is already observed stopped |
+
+### Deployment
+
+The Deployment view tracks the launch and teardown of a Voxel deployment, and
+contains **Overall Progress**, **Phases**, **Status**, **Current Phase**, and
+**Logs** in separate sections. Live probes are used to track observed deployment
+and route state.
+
+Logs are displayed oldest to newest, with new entries edging older ones out of
+the bounded view. Press `f` to filter them by level: All, Info, Warning, or
+Error. The complete history remains in the durable log file.
 
 ### Display
 
-Below `48x16`, the TUI displays its minimum-size requirement instead of
-clipping an unsafe layout.
+Compact windows prioritize focussed sections while keeping folded sections
+minimized. Below `48x16`, the TUI displays its minimum-size requirement instead
+of clipping an unsafe layout.
 
 ## Testing
 

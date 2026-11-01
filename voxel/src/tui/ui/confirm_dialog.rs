@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The confirmation overlay, with the options and shortcuts each
-//! confirmation offers.
+//! The confirmation overlay for launch, route, quit and destroy requests,
+//! with the options and shortcuts each confirmation offers.
 
 use super::{
     popup::{Button, Popup},
@@ -17,8 +17,30 @@ use ratatui::text::{Line, Text};
 
 fn prompt(confirmation: &Confirmation) -> &'static str {
     match confirmation {
+        Confirmation::Launch => "Launch deployment?",
+        Confirmation::Route => "Apply routes?",
         Confirmation::Quit => "Quit Voxel TUI?",
+        Confirmation::QuitAndDestroy => "Quit and destroy the deployment?",
+        Confirmation::CancelAndDestroy => {
+            "Stop the operation and destroy the deployment?"
+        }
+        Confirmation::ForceStop => "Force stop the running command?",
     }
+}
+
+fn body(confirmation: &Confirmation) -> Text<'static> {
+    let mut lines = Vec::new();
+    if matches!(confirmation, Confirmation::CancelAndDestroy) {
+        lines.push(Line::from(
+            "The running command is allowed to finish safely first, so this can take a moment.",
+        ));
+    }
+    if matches!(confirmation, Confirmation::ForceStop) {
+        lines.push(Line::from(
+            "This can leave the deployment half-built. Use it only when the command will not stop on its own.",
+        ));
+    }
+    Text::from(lines)
 }
 
 fn popup(app: &App, confirmation: &Confirmation) -> Popup<'static> {
@@ -38,7 +60,7 @@ fn popup(app: &App, confirmation: &Confirmation) -> Popup<'static> {
         .collect();
     Popup {
         header: Line::from(prompt(confirmation)),
-        body: Text::default(),
+        body: body(confirmation),
         buttons,
     }
 }

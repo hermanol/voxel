@@ -7,9 +7,11 @@
 
 use ratatui::style::Color;
 pub const OX_OFF_WHITE: Color = Color::Rgb(0xE0, 0xE0, 0xE0);
+pub const OX_RED: Color = Color::Rgb(255, 145, 173);
 pub const OX_GREEN_LIGHT: Color = Color::Rgb(0x48, 0xD5, 0x97);
 pub const OX_GREEN_DARKEST: Color = Color::Rgb(0x0B, 0x14, 0x18);
 pub const TUI_BLACK: Color = Color::Rgb(0x1E, 0x1E, 0x22);
+pub const TUI_YELLOW: Color = Color::Rgb(0xF1, 0xD7, 0x8F);
 pub const TUI_GREEN: Color = Color::Rgb(0x8F, 0xEF, 0xBF);
 pub const TUI_GREEN_DARK: Color = Color::Rgb(0x2E, 0x81, 0x60);
 pub const TUI_GREY: Color = Color::Rgb(0x78, 0x78, 0x7A);

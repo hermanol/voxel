@@ -7,7 +7,9 @@
 
 pub mod colors;
 pub mod confirm_dialog;
+pub mod deployment;
 pub mod help;
+pub mod logs;
 pub(crate) mod popup;
 pub mod renderer;
 pub mod splash;
