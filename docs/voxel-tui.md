@@ -4,7 +4,8 @@
 a Voxel deployment. The TUI supervises the public `voxel launch`, `voxel
 route`, and `voxel destroy` commands as opaque child processes. Its displayed
 phase transitions are advisory hints parsed from output, not lifecycle APIs or
-proof of deployment state. It tracks deployment state through live probes.
+proof of deployment state. It tracks deployment state through live probes
+implemented by collector and telemetry interfaces.
 
 ## Usage
 
@@ -47,19 +48,22 @@ $ voxel config set external.mode lan
 
 ## Views and actions
 
-The Deployment view has a number of foldable sections stacked within it. `Up`
-and `Down` move within the focused section. `Tab` and `Shift-Tab` move section
-focus, and `Space` folds or expands the focused section.
+The TUI has two alternate views, Deployment and Monitoring. Each view has a
+number of foldable sections stacked within it. `Up` and `Down` move within the
+focused section. `Tab` and `Shift-Tab` move section focus, `Space` folds or
+expands the focused section, and `v` toggles the active view.
 
 | Key | Action |
 |---|---|
+| `v` | Toggle Deployment / Monitoring |
 | `Tab` / `Shift-Tab` | Next / previous top-level section |
 | `Space` | Fold / expand the focused section |
+| `Left` / `Right` | Previous / next rack in Rack Summary |
 | `Up` / `Down` | Navigate within the focused section |
 | `PageUp` / `PageDown` | Page nested content without changing section focus |
-| `Enter` | Select the highlighted confirmation option |
+| `Enter` | Open the selected topology resource detail |
 | `?` | Open or close Help |
-| `Esc` | Dismiss the topmost confirmation or Help |
+| `Esc` | Dismiss the topmost confirmation, Help, detail, or selection |
 | `f` | Cycle the level filter while Deployment Logs is focused |
 | `l` / `r` | Request launch / route |
 | `x` | Stop the operation and destroy the deployment; press again to force stop a command that will not settle |
@@ -79,11 +83,27 @@ Logs are displayed oldest to newest, with new entries edging older ones out of
 the bounded view. Press `f` to filter them by level: All, Info, Warning, or
 Error. The complete history remains in the durable log file.
 
+### Monitoring
+
+The Monitoring view exposes the state of a Voxel deployment, and contains
+**Rack Summary** and **Topology** in separate sections.
+Rack Summary reports RSS readiness and health counts.
+Topology presents fleet routers, the shared switch-fabric bus, rack-local switch
+zones, and sleds in the order of router → switch zone → sled.
+
+The resource inspector sits beside the topology on wide layouts and below it on
+compact layouts. Health summarizes sled-agent, maintenance services, zones, and
+NTP probes for sleds, and address probes for routers and switch zones. The
+inspector also shows the last successful probe, latest collection error, and
+addresses. A node with no successful sample says so rather than reporting
+healthy.
+
 ### Display
 
-Compact windows prioritize focussed sections while keeping folded sections
-minimized. Below `48x16`, the TUI displays its minimum-size requirement instead
-of clipping an unsafe layout.
+Wide terminals place topology and inspector side by side. Compact windows will
+stack them and page resources rather than hiding labels, and prioritize focussed
+sections while keeping folded sections minimized. Below `48x16`, the TUI
+displays its minimum-size requirement instead of clipping an unsafe layout.
 
 ## Testing
 

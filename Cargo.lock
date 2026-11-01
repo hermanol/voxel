@@ -6125,6 +6125,7 @@ dependencies = [
  "attest-mock",
  "base64 0.22.1",
  "camino",
+ "chrono",
  "clap",
  "crossterm",
  "expectorate",

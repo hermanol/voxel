@@ -11,12 +11,15 @@ use super::{
     deployment,
     renderer::{LayoutMode, MIN_HEIGHT, MIN_WIDTH, layout_mode},
 };
-use crate::tui::{app::App, event::Confirmation};
+use crate::tui::{
+    app::App,
+    event::{Confirmation, View},
+};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs},
 };
 
 pub(crate) fn terminal_width(text: &str) -> usize {
@@ -63,29 +66,66 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let alerts = app.operation.retained_warnings.len()
         + usize::from(app.operation.start_failure.is_some())
         + usize::from(app.deployment.reconciliation_failure.is_some());
+    let titles = ["Deployment", "Monitoring"]
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    let tabs = Tabs::new(titles)
+        .select(usize::from(app.session.view == View::Monitor))
+        .style(Style::default().fg(TUI_GREY))
+        .highlight_style(header_style(true))
+        .divider(Span::styled(" │ ", Style::default().fg(TUI_GREY_DARK)));
     let state = format!("{:?} │ alerts {alerts}", app.deployment.observed);
-    let header =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(32)])
-            .split(root.header);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .title(" VOXEL ")
-            .border_style(line_style(true)),
-        header[0],
-    );
-    frame.render_widget(
-        Paragraph::new(state)
-            .style(Style::default().fg(OX_OFF_WHITE))
-            .right_aligned()
-            .block(
+    if area.width < 80 {
+        let header =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(2)])
+                .split(root.header);
+        frame.render_widget(
+            Paragraph::new(format!(" VOXEL · {state}"))
+                .style(Style::default().fg(OX_OFF_WHITE)),
+            header[0],
+        );
+        frame.render_widget(
+            tabs.block(
                 Block::default()
                     .borders(Borders::BOTTOM)
                     .border_style(line_style(true)),
             ),
-        header[1],
-    );
-    deployment::draw(frame, root.content, app, root.mode);
+            header[1],
+        );
+    } else {
+        let header =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(32)])
+                .split(root.header);
+        frame.render_widget(
+            tabs.block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .title(" VOXEL ")
+                    .border_style(line_style(true)),
+            ),
+            header[0],
+        );
+        frame.render_widget(
+            Paragraph::new(state)
+                .style(Style::default().fg(OX_OFF_WHITE))
+                .right_aligned()
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(line_style(true)),
+                ),
+            header[1],
+        );
+    }
+    match app.session.view {
+        View::Deployment => {
+            deployment::draw(frame, root.content, app, root.mode)
+        }
+        View::Monitor => {
+            super::monitor::draw(frame, root.content, app, root.mode)
+        }
+    }
     frame.render_widget(
         Paragraph::new(guidance_lines(app, root.footer.width)),
         root.footer,
@@ -266,7 +306,7 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     let contextual_navigation = if narrow { "Tab/⇧" } else { "Tab/S-Tab" };
     if let Some(confirmation) = &app.session.confirmation {
         return vec![
-            group("↑/↓", "move"),
+            group("←/→", "move"),
             group("Enter", "select"),
             group(
                 "y",
@@ -282,6 +322,45 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     if app.session.help_open {
         let mut groups = vec![group("↑/↓", "scroll"), group("?/Esc", "close")];
         groups.extend(lifecycle());
+        return groups;
+    }
+    if app.session.detail_open {
+        let mut groups = vec![
+            group("↑/↓", "scroll"),
+            group("←/→", "node"),
+            group("Esc", "rack"),
+            group("?", "help"),
+        ];
+        groups.extend(lifecycle());
+        return groups;
+    }
+    if app.session.view == View::Monitor {
+        let pane = app.session.monitoring_pane;
+        let expanded = app.session.monitoring_expanded(pane);
+        let mut groups =
+            vec![group("Space", if expanded { "fold" } else { "expand" })];
+        if expanded {
+            match pane {
+                crate::tui::event::MonitoringPane::RackSummary => {
+                    groups.push(group("←/→", "rack"));
+                }
+                crate::tui::event::MonitoringPane::Topology => {
+                    groups.push(group("↑↓←→", "node"));
+                    if app.session.selected_resource.is_some() {
+                        groups.push(group("Enter", "details"));
+                    }
+                }
+            }
+        }
+        if app.session.selected_resource.is_some() {
+            groups.push(group("Esc", if narrow { "" } else { "clear" }));
+        }
+        groups.extend([
+            group(contextual_navigation, "section"),
+            group("v", "view"),
+        ]);
+        groups.extend(lifecycle());
+        groups.push(group("?", "help"));
         return groups;
     }
     let mut groups = Vec::new();
@@ -317,7 +396,8 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
             | crate::tui::event::DeploymentPane::CurrentPhase => {}
         }
     }
-    groups.push(group(contextual_navigation, "section"));
+    groups
+        .extend([group(contextual_navigation, "section"), group("v", "view")]);
     groups.extend(lifecycle());
     groups.push(group("?", "help"));
     groups
@@ -339,6 +419,11 @@ fn minimum(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
 /// The theme background painted under every frame.
 pub(crate) fn background() -> Style {
     Style::default().bg(TUI_BLACK)
+}
+
+/// A highlighted item: the selected node, rack, or option.
+pub(crate) fn selection_style() -> Style {
+    Style::default().bg(TUI_PURPLE).fg(TUI_BLACK)
 }
 
 /// Border lines: dark green where focus is, grey elsewhere.
@@ -404,7 +489,7 @@ mod tests {
         operation::OperationKind,
         reconcile::ObservedDeploymentState,
         terminal::key_action,
-        test_support::key_codes,
+        test_support::{key_codes, sled},
     };
     use crossterm::event::{KeyEvent, KeyModifiers};
 
@@ -414,13 +499,15 @@ mod tests {
     /// in a state need to be named as hidden.
     #[test]
     fn footer_advertises_only_keys_that_act() {
+        let descriptor = sled(0, 0);
         let app = |setup: &dyn Fn(&mut App)| {
-            let mut app = App::new(8);
+            let mut app = App::new(vec![descriptor.clone()], 8);
             setup(&mut app);
             app
         };
+        let monitor = |app: &mut App| app.session.view = View::Monitor;
         // (case, app, group shown, group prefix not shown)
-        let cases: [(&str, App, &str, Option<&str>); 5] = [
+        let cases: [(&str, App, &str, Option<&str>); 7] = [
             (
                 "deployment idle",
                 app(&|app| {
@@ -444,6 +531,17 @@ mod tests {
                     ))
                 }),
                 "x destroy",
+                None,
+            ),
+            ("monitor", app(&monitor), "↑↓←→ node", None),
+            (
+                "node details",
+                app(&|app| {
+                    monitor(app);
+                    app.session.selected_resource = Some(descriptor.id.clone());
+                    app.session.detail_open = true;
+                }),
+                "Esc rack",
                 None,
             ),
             (

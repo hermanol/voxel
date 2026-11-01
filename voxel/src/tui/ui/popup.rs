@@ -7,10 +7,10 @@
 //! hold rather than to the screen.
 
 use super::{
-    colors::{OX_OFF_WHITE, TUI_BLACK, TUI_PURPLE},
+    colors::{OX_OFF_WHITE, TUI_PURPLE},
     widgets::{
         background, header_style, help_function_style, help_key_style,
-        line_style, popup_backdrop, rounded_block,
+        line_style, popup_backdrop, rounded_block, selection_style,
     },
 };
 use std::ops::Range;
@@ -36,10 +36,7 @@ pub(crate) struct Button<'a> {
 impl Button<'_> {
     fn text(&self) -> Line<'_> {
         let (label, key) = if self.selected {
-            let style = Style::default()
-                .bg(TUI_PURPLE)
-                .fg(TUI_BLACK)
-                .add_modifier(Modifier::BOLD);
+            let style = selection_style().add_modifier(Modifier::BOLD);
             (style, style)
         } else {
             (help_function_style(), help_key_style())
