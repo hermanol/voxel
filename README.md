@@ -21,7 +21,8 @@ generation.
   scripts that bake a control-plane image from an omicron commit.
 
 See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
-there are a LOT of tuning knobs.
+there are a LOT of tuning knobs. Terminal-interface operators should also see
+the [`voxel tui` guide](docs/voxel-tui.md).
 
 ## Building
 

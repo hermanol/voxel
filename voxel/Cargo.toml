@@ -10,8 +10,16 @@ edition = "2024"
 name = "voxel"
 path = "src/main.rs"
 
+[features]
+# `voxel tui`. Building without it leaves the CLI and drops the terminal UI's
+# dependencies.
+tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm"]
+
 [dependencies]
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
 libfalcon.workspace = true
 propolis-client.workspace = true
 anyhow.workspace = true
@@ -53,3 +61,4 @@ sprockets-tls-test-utils.workspace = true
 
 [dev-dependencies]
 expectorate.workspace = true
+tempfile.workspace = true

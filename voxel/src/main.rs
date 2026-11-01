@@ -43,6 +43,8 @@ mod sp_cmd;
 mod sp_host;
 mod topo;
 mod tufrepo;
+#[cfg(feature = "tui")]
+mod tui;
 mod util;
 
 #[derive(Parser)]
@@ -78,6 +80,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the terminal interface.
+    #[cfg(feature = "tui")]
+    Tui,
     /// Launch the rack and stream RSS bring-up progress.
     Launch {
         /// Don't watch RSS bring-up after launch.
@@ -691,9 +696,32 @@ fn anchor_workdir(
     Ok(())
 }
 
+#[cfg(feature = "tui")]
+fn resolve_tui_workdir(
+    cli: &Cli,
+    config_path: &Utf8Path,
+    config: &VoxelConfig,
+    invocation_dir: &Utf8Path,
+) -> anyhow::Result<Utf8PathBuf> {
+    let make_absolute = |path: Utf8PathBuf| {
+        if path.is_absolute() { path } else { invocation_dir.join(path) }
+    };
+    cli.workdir
+        .clone()
+        .or_else(|| config.falcon.workdir.clone().map(Utf8PathBuf::from))
+        .or_else(|| config_path.parent().map(Utf8Path::to_path_buf))
+        .map(make_absolute)
+        .context("cannot resolve TUI workdir")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
+    #[cfg(feature = "tui")]
+    let invocation_dir = Utf8PathBuf::try_from(
+        std::env::current_dir().context("resolve invocation directory")?,
+    )
+    .context("invocation directory is not valid UTF-8")?;
     // Anchor to the project root before anything touches cargo-bay/.falcon.
     let config_path = discover_config(cli.config.as_deref());
     // A missing config means defaults; an existing one that fails to load or
@@ -706,6 +734,16 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
+        #[cfg(feature = "tui")]
+        Cmd::Tui => {
+            let workdir = resolve_tui_workdir(
+                &cli,
+                &config_path,
+                &load_config(&config_path)?,
+                &invocation_dir,
+            )?;
+            tui::run(workdir).await
+        }
         Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
             let opts = rack::LaunchOpts {
                 no_progress: *no_progress,
@@ -914,5 +952,18 @@ mod tests {
         assert!(find("43bb5af99ec").ends_with("omicron-43bb5af"));
         // No match falls back to the exact (nonexistent) path.
         assert!(find("deadbeef").ends_with("omicron-deadbeef"));
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn parses_tui_commands_and_preserves_launch_parsing() {
+        let tui = cfg!(feature = "tui");
+        assert_eq!(Cli::try_parse_from(["voxel", "tui"]).is_ok(), tui);
+        assert!(Cli::try_parse_from(["voxel", "launch", "--emu"]).is_ok());
     }
 }

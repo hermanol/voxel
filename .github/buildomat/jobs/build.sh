@@ -50,9 +50,11 @@ set -o xtrace
 banner "check"
 cargo fmt -- --check
 cargo clippy --all-targets -- --deny warnings
+cargo clippy --all-targets --features voxel/tui -- --deny warnings
 
 banner "test"
 cargo test
+cargo test --features voxel/tui
 
 banner "build"
 ptime -m cargo build --release
